@@ -1,0 +1,21 @@
+<user_preferences>
+{preference}
+</user_preferences>
+
+<given_chunk>
+{chunk}
+</given_chunk>
+
+<reason>
+{reason}
+</reason>
+
+<task>
+Generate a concise, preference-aware rewrite of the given chunk.
+
+- Write a concise rewrite using only the <rewrite> XML tag.
+- Emphasize content related to the user’s preference.
+- Do not include any explanation or other tags.
+</task>
+
+<answer>
