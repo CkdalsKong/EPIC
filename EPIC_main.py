@@ -133,14 +133,14 @@ class EPICMain:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, required=True, choices=["EPIC"])
+    parser.add_argument("--method", type=str, required=True, choices=["EPIC", "cosine"])
     parser.add_argument("--persona_index", type=str, required=True, help="Persona index (0-10) or 'all'")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use (e.g., cuda:0)")
     parser.add_argument("--mode", type=str, required=True, choices=["indexing", "generation", "evaluation", "all"], help="Mode to run: 'indexing', 'generation', 'evaluation', or 'all'")
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output folder")
     parser.add_argument("--dataset", type=str, required=True, help="Path to the dataset file")
     parser.add_argument("--emb_model_name", type=str, default="facebook/contriever")
-    parser.add_argument("--doc_mode", type=str, required=True, choices=["wiki", "eli5"], help="Document mode: 'wiki' for PrefWiki, PrefRQ, 'eli5' for PrefELI5")
+    parser.add_argument("--doc_mode", type=str, required=True, choices=["wiki", "eli5", "wiki_total", "eli5_total"], help="Document mode: 'wiki' for PrefWiki, PrefRQ, 'eli5' for PrefELI5")
     parser.add_argument("--vllm_server_url", type=str, default="8008", help="vLLM server URL or port number (e.g., 8006 or http://localhost:8008/v1)")
     parser.add_argument("--llm_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM model name")
     args = parser.parse_args()

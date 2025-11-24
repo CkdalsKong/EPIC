@@ -89,46 +89,146 @@ class EPICIndexing:
         keep_indices = []
         relevant_preferences = []
         relevant_similarities = []
-        
-        batch_size = self.batch_size
-        for i in tqdm(range(0, len(chunk_embeddings_norm), batch_size), desc=f"Filtering persona {persona_index}"):
-            batch_embeddings = chunk_embeddings_norm[i:i + batch_size]
-            batch_chunks = chunks[i:i + batch_size]
-            
-            sims = np.dot(preference_embeddings, batch_embeddings.T)
-            above = sims > self.utils.threshold
-            mask = np.any(above, axis=0)
-            
-            for j, (chunk, is_kept) in enumerate(zip(batch_chunks, mask)):
-                if is_kept:
-                    kept_chunks.append(chunk)
-                    relevant_idx = np.where(above[:, j])[0]
-                    relevant_prefs = [preference_list[k] for k in relevant_idx]
-                    relevant_sim_values = [sims[k, j] for k in relevant_idx]
-                    
-                    kept_save.append({
-                        "chunk": chunk,
-                        "relevant_preferences": relevant_prefs,
-                        "relevant_similarities": [float(sim) for sim in relevant_sim_values]
-                    })
-                    relevant_preferences.append(relevant_prefs)
-                    relevant_similarities.append(relevant_sim_values)
-                else:
-                    filtered_save.append({"chunk": chunk})
-        
-        filter_time = time.time() - start_total
-        print(f"Cosine filtering completed. Kept {len(kept_chunks)} chunks out of {len(chunks)}")
-        
+
         cosine_filtering_file = os.path.join(method_dir, "cosine_filtering_results.jsonl")
-        self.utils.save_jsonl(cosine_filtering_file, kept_save)
-        print(f"✅ Cosine filtering results saved to {cosine_filtering_file}")
+
+        # For EPIC method: load cosine filtering results from cosine method's output
+        if self.method == "EPIC":
+            # Find cosine method's output directory path
+            if self.utils.llm_model_name == "openai/gpt-oss-20b":
+                cosine_method_dir = os.path.join(self.output_dir, f"cosine_oss/{persona_index}")
+            elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+                cosine_method_dir = os.path.join(self.output_dir, f"cosine_qwen/{persona_index}")
+            else:
+                cosine_method_dir = os.path.join(self.output_dir, f"cosine/{persona_index}")
+            
+            cosine_filtering_file = os.path.join(cosine_method_dir, "cosine_filtering_results.jsonl")
+            
+            if os.path.exists(cosine_filtering_file):
+                print(f"✅ Found cosine filtering results from cosine method: {cosine_filtering_file}")
+                # Load JSONL
+                with open(cosine_filtering_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        entry = json.loads(line)
+                        kept_save.append(entry)
+                        kept_chunks.append(entry.get("chunk", ""))
+                        relevant_preferences.append(entry.get("relevant_preferences", []))
+                        relevant_similarities.append(entry.get("relevant_similarities", []))
+                filter_time = 0.0
+                print(f"Loaded {len(kept_chunks)} kept chunks from cosine method results")
+            else:
+                raise FileNotFoundError(f"❌ Cosine filtering results not found. Please run cosine method first: {cosine_filtering_file}")
+        
+        # For cosine method: only perform cosine filtering and exit
+        elif self.method == "cosine":
+            if os.path.exists(cosine_filtering_file):
+                print(f"⚠️ Found existing cosine results. Skipping filtering: {cosine_filtering_file}")
+                # Load JSONL
+                with open(cosine_filtering_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        entry = json.loads(line)
+                        kept_save.append(entry)
+                        kept_chunks.append(entry.get("chunk", ""))
+                        relevant_preferences.append(entry.get("relevant_preferences", []))
+                        relevant_similarities.append(entry.get("relevant_similarities", []))
+                filter_time = 0.0
+                print(f"Loaded {len(kept_chunks)} kept chunks from cache")
+            else:
+                batch_size = self.batch_size
+                for i in tqdm(range(0, len(chunk_embeddings_norm), batch_size), desc=f"Filtering persona {persona_index}"):
+                    batch_embeddings = chunk_embeddings_norm[i:i + batch_size]
+                    batch_chunks = chunks[i:i + batch_size]
+                    
+                    sims = np.dot(preference_embeddings, batch_embeddings.T)
+                    above = sims > self.utils.threshold
+                    mask = np.any(above, axis=0)
+                    
+                    for j, (chunk, is_kept) in enumerate(zip(batch_chunks, mask)):
+                        if is_kept:
+                            kept_chunks.append(chunk)
+                            relevant_idx = np.where(above[:, j])[0]
+                            relevant_prefs = [preference_list[k] for k in relevant_idx]
+                            relevant_sim_values = [sims[k, j] for k in relevant_idx]
+                            
+                            kept_save.append({
+                                "chunk": chunk,
+                                "relevant_preferences": relevant_prefs,
+                                "relevant_similarities": [float(sim) for sim in relevant_sim_values]
+                            })
+                            relevant_preferences.append(relevant_prefs)
+                            relevant_similarities.append(relevant_sim_values)
+                        else:
+                            filtered_save.append({"chunk": chunk})
+                
+                filter_time = time.time() - start_total
+                print(f"Cosine filtering completed. Kept {len(kept_chunks)} chunks out of {len(chunks)}")
+                self.utils.save_jsonl(cosine_filtering_file, kept_save)
+                print(f"✅ Cosine filtering results saved to {cosine_filtering_file}")
+            
+            # For cosine method: exit after saving JSONL (no CSV report, no LLM filtering, no FAISS indexing)
+            total_time = time.time() - start_total
+            print(f"\n=== Completed cosine filtering for persona {persona_index} ===")
+            print(f"Total time: {total_time:.2f} seconds")
+            return method_dir
+        
+        # For EPIC method: continue with existing logic (LLM filtering, rewriting, FAISS indexing)
+        else:
+            if os.path.exists(cosine_filtering_file):
+                print(f"⚠️ Found existing cosine results. Skipping filtering: {cosine_filtering_file}")
+                # Load JSONL
+                with open(cosine_filtering_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        entry = json.loads(line)
+                        kept_save.append(entry)
+                        kept_chunks.append(entry.get("chunk", ""))
+                        relevant_preferences.append(entry.get("relevant_preferences", []))
+                        relevant_similarities.append(entry.get("relevant_similarities", []))
+                filter_time = 0.0
+                print(f"Loaded {len(kept_chunks)} kept chunks from cache")
+            else:
+                batch_size = self.batch_size
+                for i in tqdm(range(0, len(chunk_embeddings_norm), batch_size), desc=f"Filtering persona {persona_index}"):
+                    batch_embeddings = chunk_embeddings_norm[i:i + batch_size]
+                    batch_chunks = chunks[i:i + batch_size]
+                    
+                    sims = np.dot(preference_embeddings, batch_embeddings.T)
+                    above = sims > self.utils.threshold
+                    mask = np.any(above, axis=0)
+                    
+                    for j, (chunk, is_kept) in enumerate(zip(batch_chunks, mask)):
+                        if is_kept:
+                            kept_chunks.append(chunk)
+                            relevant_idx = np.where(above[:, j])[0]
+                            relevant_prefs = [preference_list[k] for k in relevant_idx]
+                            relevant_sim_values = [sims[k, j] for k in relevant_idx]
+                            
+                            kept_save.append({
+                                "chunk": chunk,
+                                "relevant_preferences": relevant_prefs,
+                                "relevant_similarities": [float(sim) for sim in relevant_sim_values]
+                            })
+                            relevant_preferences.append(relevant_prefs)
+                            relevant_similarities.append(relevant_sim_values)
+                        else:
+                            filtered_save.append({"chunk": chunk})
+                
+                filter_time = time.time() - start_total
+                print(f"Cosine filtering completed. Kept {len(kept_chunks)} chunks out of {len(chunks)}")
+                self.utils.save_jsonl(cosine_filtering_file, kept_save)
+                print(f"✅ Cosine filtering results saved to {cosine_filtering_file}")
 
       
         print("\nStarting LLM filtering...")
-        
+
         result_info_file = os.path.join(method_dir, "result_info.jsonl")
         rewritten_file = os.path.join(method_dir, "rewritten.jsonl")
-        
+
         filtering_prompt_system = self.utils.load_prompt_template(self.utils.filtering_system)
         filtering_prompt_user = self.utils.load_prompt_template(self.utils.filtering_user)
 
@@ -137,19 +237,32 @@ class EPICIndexing:
         start_llm = time.time()
         results = []
 
-        with ThreadPoolExecutor() as executor:
-            futures = {executor.submit(self.utils.process_chunk_rand_prefs, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
-            for future in tqdm(as_completed(futures), total=len(futures), desc=f"LLM: persona {persona_index}", leave=False, ncols=100):
-                result = future.result()
-                if result:
-                    results.append(result)
+        if os.path.exists(result_info_file):
+            print(f"⚠️ Found existing result info. Skipping LLM filtering: {result_info_file}")
+            # result_info was saved via save_json (full JSON array), not JSONL
+            try:
+                with open(result_info_file, 'r', encoding='utf-8') as f:
+                    results = json.load(f)
+            except Exception:
+                # fallback to JSONL one-per-line
+                with open(result_info_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        results.append(json.loads(line))
+            llm_time = 0.0
+        else:
+            with ThreadPoolExecutor() as executor:
+                futures = {executor.submit(self.utils.process_chunk_rand_prefs, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
+                for future in tqdm(as_completed(futures), total=len(futures), desc=f"LLM: persona {persona_index}", leave=False, ncols=100):
+                    result = future.result()
+                    if result:
+                        results.append(result)
 
-            result_info_file = os.path.join(method_dir, "result_info.jsonl")
-
-            self.utils.save_json(result_info_file, results)
-            print(f"✅ Result info saved to {result_info_file}")
-            
-            llm_time = time.time() - start_llm
+                self.utils.save_json(result_info_file, results)
+                print(f"✅ Result info saved to {result_info_file}")
+                
+                llm_time = time.time() - start_llm
 
         filtered, rewritten, kept = [], [], []
         failed_chunks = [] 
@@ -188,32 +301,41 @@ class EPICIndexing:
         start_rewriting = time.time()
         rewritten_final = []
 
-        if rewritten:
-            first_entry = rewritten[0]
-            first_chunk = first_entry["chunk"]
-            preference_text_rew = "\n".join([f"- {p}" for p in preference_list])
+        if os.path.exists(rewritten_file):
+            print(f"⚠️ Found existing rewritten file. Skipping rewriting: {rewritten_file}")
+            with open(rewritten_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    rewritten_final.append(json.loads(line))
+            rewriting_time = 0.0
+        else:
+            if rewritten:
+                first_entry = rewritten[0]
+                first_chunk = first_entry["chunk"]
+                preference_text_rew = "\n".join([f"- {p}" for p in preference_list])
 
-            filled_user_prompt = rewriting_prompt_user.format(preference=preference_text_rew, chunk=first_chunk, reason=first_entry["reason"])
-            full_prompt = {
-                "system_prompt": rewriting_prompt_system,
-                "user_prompt": filled_user_prompt,
-                "full_conversation": f"System: {rewriting_prompt_system}\n\nUser: {filled_user_prompt}"
-            }
-            prompt_file = os.path.join(method_dir, "rewriting_prompt_sample.json")
-            self.utils.save_json(prompt_file, full_prompt)
-            print(f"✅ Rewriting prompt sample saved to {prompt_file}")
-        
-        with ThreadPoolExecutor() as executor:  
-            futures = [executor.submit(self.utils.rewrite_single, entry, rewriting_prompt_user, rewriting_prompt_system=rewriting_prompt_system) for entry in rewritten]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Rewriting chunks", leave=False, ncols=100):
-                try:
-                    result = future.result()
-                    rewritten_final.append(result)
-                except Exception as e:
-                    print(f"Rewriting failed: {e}")
-        rewriting_time = time.time() - start_rewriting
-        self.utils.save_jsonl(rewritten_file, rewritten_final)
-        print(f"✅ Rewriting info saved to {rewritten_file}")
+                filled_user_prompt = rewriting_prompt_user.format(preference=preference_text_rew, chunk=first_chunk, reason=first_entry["reason"])
+                full_prompt = {
+                    "system_prompt": rewriting_prompt_system,
+                    "user_prompt": filled_user_prompt,
+                    "full_conversation": f"System: {rewriting_prompt_system}\n\nUser: {filled_user_prompt}"
+                }
+                prompt_file = os.path.join(method_dir, "rewriting_prompt_sample.json")
+                self.utils.save_json(prompt_file, full_prompt)
+                print(f"✅ Rewriting prompt sample saved to {prompt_file}")
+            
+            with ThreadPoolExecutor() as executor:  
+                futures = [executor.submit(self.utils.rewrite_single, entry, rewriting_prompt_user, rewriting_prompt_system=rewriting_prompt_system) for entry in rewritten]
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Rewriting chunks", leave=False, ncols=100):
+                    try:
+                        result = future.result()
+                        rewritten_final.append(result)
+                    except Exception as e:
+                        print(f"Rewriting failed: {e}")
+            rewriting_time = time.time() - start_rewriting
+            self.utils.save_jsonl(rewritten_file, rewritten_final)
+            print(f"✅ Rewriting info saved to {rewritten_file}")
         
         print(f"Rewriting completed. rewritten {len(rewritten_final)} chunks")
         merged_chunks = [item["rewritten"] for item in rewritten_final] + [item["chunk"] for item in kept]

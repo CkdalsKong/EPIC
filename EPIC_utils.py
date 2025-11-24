@@ -30,6 +30,7 @@ class EPICUtils:
     def __init__(self, mode, method, device, output_dir, dataset=None, emb_model_name="facebook/contriever", doc_mode="wiki", vllm_server_url="http://localhost:8008/v1", llm_model_name="meta-llama/Llama-3.1-8B-Instruct"):
 
         self.root_dir = "data"
+        self.root_dir_corpus = "../data/corpus"
         self.top_k = 5
 
         self.prompt_dir = "prompt"
@@ -111,15 +112,25 @@ class EPICUtils:
             self.output_dir = f"{self.output_dir}/wiki"
         elif doc_mode == "eli5":
             self.output_dir = f"{self.output_dir}/eli5"
+        elif doc_mode == "wiki_total":
+            self.output_dir = f"{self.output_dir}/wiki_total"
+        elif doc_mode == "eli5_total":
+            self.output_dir = f"{self.output_dir}/eli5_total"
         else:
             self.output_dir = f"{self.output_dir}/sample"
 
         if doc_mode == "wiki":
-            self.chunk_file = "sampled_wiki_chunk_10000.jsonl"
-            self.embedding_file = f"sampled_wiki_embedding_{model_name_clean}_10000.npy"
+            self.chunk_file = os.path.join(self.root_dir_corpus, "final/sampled_wiki_chunk_10000.jsonl")
+            self.embedding_file = os.path.join(self.root_dir_corpus, f"final/sampled_wiki_embedding_{model_name_clean}_10000.npy")
         elif doc_mode == "eli5":
-            self.chunk_file = "sampled_eli5_chunk_2000.jsonl"
-            self.embedding_file = f"sampled_eli5_embedding_{model_name_clean}_2000.npy"
+            self.chunk_file = os.path.join(self.root_dir_corpus, "final/sampled_eli5_chunk_2000.jsonl")
+            self.embedding_file = os.path.join(self.root_dir_corpus, f"final/sampled_eli5_embedding_{model_name_clean}_2000.npy")
+        elif doc_mode == "wiki_total":
+            self.chunk_file = os.path.join(self.root_dir_corpus, "full_chunks_with_doc_sw.jsonl")
+            self.embedding_file = os.path.join(self.root_dir_corpus, f"full_sw_embeddings_with_doc_{model_name_clean}.npy")
+        elif doc_mode == "eli5_total":
+            self.chunk_file = os.path.join(self.root_dir_corpus, "full_eli5_chunks_with_doc_sw.jsonl")
+            self.embedding_file = os.path.join(self.root_dir_corpus, f"full_sw_eli5_embeddings_with_doc_{model_name_clean}.npy")
         
         self.emb_tokenizer = None
         self.emb_model = None
