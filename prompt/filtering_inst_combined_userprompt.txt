@@ -1,0 +1,22 @@
+<user_preferences>
+{preference}
+</user_preferences>
+
+<given_chunk>
+{chunk}
+</given_chunk>
+
+<task>
+Decide whether to Discard or Keep the given chunk based on alignment with the listed user preferences.
+If you Keep the chunk, also provide an instruction on how to interpret it.
+
+Follow these rules:
+- If the chunk is unrelated, choose <decision>Discard</decision>.
+- If the chunk is relevant, choose <decision>Keep</decision>, include matched <relevant_preferences>, and provide an <instruction>.
+- Always include a <reason> explaining the decision.
+- The <instruction> should guide readers on how to interpret the chunk given the user's preferences.
+- Output only a single <answer> XML block in strict XML format, with no extra explanation or commentary.
+</task>
+
+<answer>
+

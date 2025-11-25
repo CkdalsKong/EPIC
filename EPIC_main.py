@@ -133,7 +133,7 @@ class EPICMain:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, required=True, choices=["EPIC", "cosine"])
+    parser.add_argument("--method", type=str, required=True, choices=["EPIC", "cosine", "EPIC_inst", "EPIC_inst_combined"])
     parser.add_argument("--persona_index", type=str, required=True, help="Persona index (0-10) or 'all'")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use (e.g., cuda:0)")
     parser.add_argument("--mode", type=str, required=True, choices=["indexing", "generation", "evaluation", "all"], help="Mode to run: 'indexing', 'generation', 'evaluation', or 'all'")

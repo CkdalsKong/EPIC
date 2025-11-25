@@ -39,6 +39,12 @@ class EPICUtils:
         self.filtering_user = os.path.join(self.prompt_dir, "filtering_userprompt.txt")
         self.rewriting_system = os.path.join(self.prompt_dir, "rewriting_systemprompt.txt")
         self.rewriting_user = os.path.join(self.prompt_dir, "rewriting_userprompt.txt")
+        self.inst_system = os.path.join(self.prompt_dir, "instruction_systemprompt.txt")
+        self.inst_user = os.path.join(self.prompt_dir, "instruction_userprompt.txt")
+        self.filtering_inst_system = os.path.join(self.prompt_dir, "filtering_inst_systemprompt.txt")
+        self.filtering_inst_user = os.path.join(self.prompt_dir, "filtering_inst_userprompt.txt")
+        self.filtering_inst_combined_system = os.path.join(self.prompt_dir, "filtering_inst_combined_systemprompt.txt")
+        self.filtering_inst_combined_user = os.path.join(self.prompt_dir, "filtering_inst_combined_userprompt.txt")
         self.generation_prompt = os.path.join(self.prompt_dir, "generation_prompt.txt")
 
         self.indexing_report_file = "indexing_report.csv"
@@ -795,3 +801,204 @@ class EPICUtils:
         q = preference.lower().strip()
         best = get_close_matches(q, pref_list_lower, n=1, cutoff=0.0)
         return lower_to_orig[best[0]] if best else None
+
+    def parse_instruction(self, input_string):
+        """Parse instruction from LLM response"""
+        soup = BeautifulSoup(input_string, "html.parser")
+        instruction_tag = soup.find("instruction")
+        if instruction_tag:
+            return instruction_tag.text.strip()
+        else:
+            # Fallback: return the full response if no instruction tag found
+            return input_string.strip() if input_string else None
+
+    def parse_decision_reason_instruction(self, input_string):
+        """Parse decision, reason, preferences, and instruction from LLM response (for EPIC_inst_combined)"""
+        soup = BeautifulSoup(input_string, "html.parser")
+        decision_tag = soup.find("decision")
+        reason_tag = soup.find("reason")
+        preference_tags = soup.find_all("preference")
+        instruction_tag = soup.find("instruction")
+        
+        decision = decision_tag.text.strip() if decision_tag else ""
+        reason = reason_tag.text.strip() if reason_tag else ""
+        preferences = [tag.text.strip() for tag in preference_tags if tag.text.strip()]
+        instruction = instruction_tag.text.strip() if instruction_tag else ""
+        
+        # Clean preference text
+        preferences = [self.clean_preference_text(pref) for pref in preferences]
+        
+        return decision, reason, preferences, instruction
+
+    def inst_single(self, entry, inst_prompt_user, inst_prompt_system=None):
+        """Generate instruction for a single kept chunk"""
+        original_chunk = entry["chunk"]
+        reason = entry.get("reason", "")
+        preferences = entry.get("relevant_preference", [])
+        preference_text = "\n".join([f"- {p}" for p in preferences]) if isinstance(preferences, list) else preferences
+        
+        try:
+            filled_prompt = inst_prompt_user.format(preference=preference_text, chunk=original_chunk, reason=reason)
+            if inst_prompt_system is None:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt="You are a helpful assistant tasked with generating interpretation instructions for document chunks."
+                )
+            else:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt=inst_prompt_system
+                )
+            
+            if llm_response is None:
+                print(f"Warning: LLM returned None response for instruction generation - using default")
+                instruction_text = f"Focus on aspects related to: {preference_text}"
+            else:
+                instruction_text = self.parse_instruction(llm_response)
+                if instruction_text is None:
+                    instruction_text = f"Focus on aspects related to: {preference_text}"
+                    
+        except Exception as e:
+            print(f"Failed to generate instruction: {e} - using default")
+            instruction_text = f"Focus on aspects related to: {preference_text}"
+        
+        return {
+            "chunk": original_chunk,
+            "instruction": instruction_text,
+            "reason": reason,
+            "relevant_preference": preferences
+        }
+
+    def process_chunk_inst(self, idx, chunk_text, preference_text, prompt_template, prompt_template_system=None, preference_list=None, kept_save_info=None):
+        """Process chunk for EPIC_inst: filter first, then generate instruction separately"""
+        # This is similar to process_chunk_rand_prefs but focuses on filtering
+        # The instruction generation happens later in inst_single()
+        
+        # Shuffle preferences for filtering
+        shuffled_list = preference_list[:]
+        random.Random(idx).shuffle(shuffled_list)
+        shuffled_preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(shuffled_list)])
+        filled_prompt = self.format_prompt(prompt_template, shuffled_preference_text, chunk_text)
+        
+        try:
+            if prompt_template_system is None:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt="You are a helpful assistant for indexing document chunks."
+                )
+            else:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt=prompt_template_system
+                )
+            
+            if llm_response is None:
+                print(f"Warning: LLM returned None response - using Discard decision")
+                return {
+                    "chunk": chunk_text,
+                    "decision": "Discard",
+                    "reason": "LLM returned None response",
+                    "status": "failed"
+                }
+            
+            # Parse decision and reason
+            decision, reason, preferences = self.parse_decision_and_reason_preferences(llm_response)
+            
+            # Map numbered preferences to actual text
+            if preference_list and preferences:
+                for i, preference in enumerate(preferences):
+                    preferences[i] = self.map_preference_numbers_to_text(preference, preference_list)
+            
+            if decision == "":
+                print(f"Warning: Empty decision from LLM response - using Discard decision")
+                return {
+                    "chunk": chunk_text,
+                    "decision": "Discard",
+                    "reason": "Empty decision from LLM response",
+                    "status": "failed"
+                }
+            
+            return {
+                "chunk": chunk_text,
+                "decision": decision,
+                "reason": reason,
+                "relevant_preference": preferences,
+                "instruction": "",  # Will be generated later
+                "status": "success"
+            }
+                
+        except Exception as e:
+            print(f"Failed to process chunk: {e}")
+            return {
+                "chunk": chunk_text,
+                "decision": "Discard",
+                "reason": f"LLM processing failed: {str(e)}",
+                "status": "failed"
+            }
+
+    def process_chunk_inst_combined(self, idx, chunk_text, preference_text, prompt_template, prompt_template_system=None, preference_list=None, kept_save_info=None):
+        """Process chunk for EPIC_inst_combined: filter and generate instruction simultaneously"""
+        # Shuffle preferences
+        shuffled_list = preference_list[:]
+        random.Random(idx).shuffle(shuffled_list)
+        shuffled_preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(shuffled_list)])
+        filled_prompt = self.format_prompt(prompt_template, shuffled_preference_text, chunk_text)
+        
+        try:
+            if prompt_template_system is None:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt="You are a helpful assistant for indexing document chunks."
+                )
+            else:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt=prompt_template_system
+                )
+            
+            if llm_response is None:
+                print(f"Warning: LLM returned None response - using Discard decision")
+                return {
+                    "chunk": chunk_text,
+                    "decision": "Discard",
+                    "reason": "LLM returned None response",
+                    "instruction": "",
+                    "status": "failed"
+                }
+            
+            # Parse decision, reason, preferences, and instruction
+            decision, reason, preferences, instruction = self.parse_decision_reason_instruction(llm_response)
+            
+            # Map numbered preferences to actual text
+            if preference_list and preferences:
+                for i, preference in enumerate(preferences):
+                    preferences[i] = self.map_preference_numbers_to_text(preference, preference_list)
+            
+            if decision == "":
+                print(f"Warning: Empty decision from LLM response - using Discard decision")
+                return {
+                    "chunk": chunk_text,
+                    "decision": "Discard",
+                    "reason": "Empty decision from LLM response",
+                    "instruction": "",
+                    "status": "failed"
+                }
+            
+            return {
+                "chunk": chunk_text,
+                "decision": decision,
+                "reason": reason,
+                "relevant_preference": preferences,
+                "instruction": instruction,
+                "status": "success"
+            }
+                
+        except Exception as e:
+            print(f"Failed to process chunk: {e}")
+            return {
+                "chunk": chunk_text,
+                "decision": "Discard",
+                "reason": f"LLM processing failed: {str(e)}",
+                "instruction": "",
+                "status": "failed"
+            }
