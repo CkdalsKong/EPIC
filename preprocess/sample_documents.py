@@ -39,6 +39,39 @@ def sample_wiki_documents(input_dir, output_dir, sample_size):
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
     print(f"{len(sampled_docs)} docs saved in {output_file}")
 
+def sample_lmsys_documents(input_file, output_dir, sample_size):
+    # Load raw file
+    print(f"Loading documents from {input_file}")
+    
+    all_docs = []
+    with open(input_file, 'r', encoding='utf-8') as f:
+        for line in tqdm(f, desc="Loading documents"):
+            doc = json.loads(line)
+            all_docs.append(doc)
+    print(f"Total {len(all_docs)} documents loaded")
+
+    # Random sample
+    print(f"Will sample {sample_size} documents")
+    sampled_docs = random.sample(all_docs, min(sample_size, len(all_docs)))
+    
+    # Save result
+    count = 0
+    if sample_size == 100_000:
+        output_file = os.path.join(output_dir, "sampled_lmsys_doc.jsonl")
+    else:
+        output_file = os.path.join(output_dir, f"sampled_lmsys_doc_{sample_size}.jsonl")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for doc in sampled_docs:
+            record = {
+                "id": count,
+                "title": f"{doc['conversation_id']}_{doc['chunk_id']}",
+                "text": doc["text"],
+            }
+            count += 1
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+    print(f"{len(sampled_docs)} docs saved in {output_file}")
+
+
 def sample_eli5_documents(input_dir, output_dir, sample_size):
     # Load raw files
     json_files = [f for f in os.listdir(input_dir) if f.endswith('.json')]
@@ -81,9 +114,10 @@ def sample_eli5_documents(input_dir, output_dir, sample_size):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--doc_type", type=str, required=True, 
-                        choices=["wiki", "eli5"],
-                        help="Document type: wiki, eli5, or ccnews")
+                        choices=["wiki", "eli5", "lmsys"],
+                        help="Document type: wiki, eli5, or lmsys")
     parser.add_argument("--input_dir", type=str, default=None, help="Input directory")
+    parser.add_argument("--input_file", type=str, default=None, help="Input file (for lmsys)")
     parser.add_argument("--sample_size", type=int, default=10_000, help="Number of samples")
     args = parser.parse_args()
 
@@ -98,6 +132,11 @@ def main():
         sample_eli5_documents(input_dir=os.path.join(args.input_dir, "data_creation/processed_data/collected_docs/explainlikeimfive"), # ELI5 supporting documents directory
                               output_dir=output_dir,
                               sample_size=args.sample_size)
+    elif args.doc_type == "lmsys":
+        input_file = args.input_file or os.path.join(args.input_dir, "lmsys_chat1m_conv_chunks_text.jsonl")
+        sample_lmsys_documents(input_file=input_file,
+                               output_dir=output_dir,
+                               sample_size=args.sample_size)
     
 
 if __name__ == "__main__":

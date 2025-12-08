@@ -238,7 +238,10 @@ def main():
     
     # Save result
     model_name_clean = args.model_name.replace("/", "_")
-    if "10000" in args.chunk_file:
+    if "sampled_lmsys_doc" in args.chunk_file:
+        # lmsys 파일 처리: sampled_lmsys_doc.jsonl 또는 sampled_lmsys_doc_{size}.jsonl
+        output_file = args.chunk_file.replace(".jsonl", f"_embedding_{model_name_clean}.npy")
+    elif "10000" in args.chunk_file:
         output_file = args.chunk_file.replace("chunk_10000.jsonl", f"embedding_{model_name_clean}_10000.npy")
     elif "2000" in args.chunk_file:
         output_file = args.chunk_file.replace("chunk_2000.jsonl", f"embedding_{model_name_clean}_2000.npy")
