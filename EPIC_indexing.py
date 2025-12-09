@@ -202,8 +202,8 @@ class EPICIndexing:
         elif self.method == "EPIC_insight":
             insight_file = os.path.join(method_dir, "insights.jsonl")
 
-            filtering_prompt_system = self.utils.load_prompt_template(self.utils.filtering_inst_system)
-            filtering_prompt_user = self.utils.load_prompt_template(self.utils.filtering_inst_user)
+            filtering_prompt_system = self.utils.load_prompt_template(self.utils.filtering_system)
+            filtering_prompt_user = self.utils.load_prompt_template(self.utils.filtering_user)
 
         elif self.method == "EPIC_insight_combined":
             insight_file = os.path.join(method_dir, "insights.jsonl")
@@ -239,7 +239,7 @@ class EPICIndexing:
                 elif self.method == "EPIC_inst_combined":
                     futures = {executor.submit(self.utils.process_chunk_inst_combined, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
                 elif self.method == "EPIC_insight":
-                    futures = {executor.submit(self.utils.process_chunk_insight, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
+                    futures = {executor.submit(self.utils.process_chunk_rand_prefs, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
                 elif self.method == "EPIC_insight_combined":
                     futures = {executor.submit(self.utils.process_chunk_insight_combined, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
                 for future in tqdm(as_completed(futures), total=len(futures), desc=f"LLM: persona {persona_index}", leave=False, ncols=100):
@@ -264,6 +264,13 @@ class EPICIndexing:
                 filtered.append({"chunk": item["chunk"]})
             else:
                 success_count += 1
+                # For EPIC_insight: map process_chunk_rand_prefs decisions to insight decisions
+                if self.method == "EPIC_insight":
+                    if item["decision"] == "Rewrite":
+                        item["decision"] = "Keep"
+                    elif item["decision"] == "Filter":
+                        item["decision"] = "Discard"
+                
                 if item["decision"] == "Discard":
                     filtered.append({"chunk": item["chunk"]})
                 elif item["decision"] == "Rewrite":
@@ -484,14 +491,13 @@ class EPICIndexing:
         print("\nCreating FAISS index...")
         start_faiss = time.time()
         
-        # For EPIC_inst and EPIC_inst_combined: create separate FAISS per preference
+        # For EPIC_inst and EPIC_inst_combined: single FAISS with metadata (same as insight)
         if self.method in ["EPIC_inst", "EPIC_inst_combined"]:
-            print("Creating preference-specific FAISS indices...")
+            print("Creating single FAISS index with metadata (inst method)...")
             
-            # Group chunks and instructions by preference
-            preference_groups = {}  # {pref_text: [(chunk, instruction), ...]}
-            
-            for item in inst_final:
+            # Prepare metadata for each chunk
+            chunk_metadata = []
+            for idx, item in enumerate(inst_final):
                 chunk = item["chunk"]
                 instruction = item.get("instruction", "")
                 relevant_prefs = item.get("relevant_preference", [])
@@ -500,64 +506,56 @@ class EPICIndexing:
                 if isinstance(relevant_prefs, str):
                     relevant_prefs = [relevant_prefs]
                 
-                # Add this chunk to all relevant preferences
-                for pref in relevant_prefs:
-                    if pref not in preference_groups:
-                        preference_groups[pref] = []
-                    preference_groups[pref].append((chunk, instruction))
+                chunk_metadata.append({
+                    "id": idx,
+                    "text": chunk,
+                    "instruction": instruction,
+                    "relevant_preferences": relevant_prefs,
+                    "active": True
+                })
             
-            print(f"Found {len(preference_groups)} unique preferences")
+            # Generate embeddings for instructions (use instruction embeddings for retrieval)
+            instructions_list = [item["instruction"] for item in chunk_metadata]
+            print(f"Generating embeddings for {len(instructions_list)} instructions...")
+            embeddings = self.utils.embed_texts_mp(instructions_list)
+            embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
             
-            # Create mapping from preference text to index
+            # Create single FAISS index
+            dim = embeddings.shape[1]
+            print(f"Creating FAISS IndexFlatIP (dim={dim})...")
+            index = faiss.IndexFlatIP(dim)
+            index.add(embeddings.astype(np.float32))
+            
+            # Save FAISS index and embeddings
+            faiss.write_index(index, index_file)
+            print(f"✅ FAISS index saved to {index_file}")
+            np.save(embeddings_file, embeddings)
+            print(f"✅ Embeddings saved to {embeddings_file}")
+            
+            # Save chunks with metadata (including instructions and preferences)
+            kept_file = os.path.join(method_dir, "kept.jsonl")
+            self.utils.save_jsonl(kept_file, chunk_metadata)
+            print(f"✅ Kept chunks with metadata saved to {kept_file}")
+            
+            # Save preference mapping for reference
             pref_to_idx = {pref: idx for idx, pref in enumerate(preference_list)}
-            
-            # Create separate FAISS for each preference
-            for pref_text, items in preference_groups.items():
-                # Find preference index
-                pref_idx = pref_to_idx.get(pref_text, None)
-                if pref_idx is None:
-                    # Try to find closest match
-                    pref_idx = preference_list.index(pref_text) if pref_text in preference_list else -1
-                
-                if pref_idx == -1:
-                    print(f"Warning: Could not map preference '{pref_text[:50]}...' to index, skipping")
-                    continue
-                
-                # Extract chunks and instructions
-                pref_chunks = [item[0] for item in items]
-                pref_instructions = [item[1] for item in items]
-                
-                print(f"  Preference {pref_idx}: {len(pref_chunks)} chunks")
-                
-                # Generate embeddings for instructions
-                pref_embeddings = self.utils.embed_texts_mp(pref_instructions)
-                pref_embeddings = pref_embeddings / np.linalg.norm(pref_embeddings, axis=1, keepdims=True)
-                
-                # Create FAISS index
-                dim = pref_embeddings.shape[1]
-                pref_index = faiss.IndexFlatIP(dim)
-                pref_index.add(pref_embeddings.astype(np.float32))
-                
-                # Save preference-specific files
-                pref_index_file = os.path.join(data_dir, f"index_pref{pref_idx}_{model_name_clean}.faiss")
-                pref_embeddings_file = os.path.join(data_dir, f"embeddings_pref{pref_idx}_{model_name_clean}.npy")
-                pref_kept_file = os.path.join(method_dir, f"kept_pref{pref_idx}.jsonl")
-                
-                faiss.write_index(pref_index, pref_index_file)
-                np.save(pref_embeddings_file, pref_embeddings)
-                self.utils.save_jsonl(pref_kept_file, 
-                                    [{"text": chunk, "instruction": inst} for chunk, inst in zip(pref_chunks, pref_instructions)])
-                
-                print(f"  ✅ Saved FAISS for preference {pref_idx} to {pref_index_file}")
-            
-            # Also save a mapping file
             pref_mapping = {
                 "preference_to_idx": pref_to_idx,
-                "preference_list": preference_list
+                "preference_list": preference_list,
+                "total_chunks": len(chunk_metadata),
+                "method": self.method
             }
             pref_mapping_file = os.path.join(method_dir, "preference_mapping.json")
             self.utils.save_json(pref_mapping_file, pref_mapping)
             print(f"✅ Saved preference mapping to {pref_mapping_file}")
+            
+            # Print summary
+            print(f"\n📊 Instruction Indexing Summary:")
+            print(f"   Total chunks indexed: {len(chunk_metadata)}")
+            unique_prefs = set()
+            for item in chunk_metadata:
+                unique_prefs.update(item["relevant_preferences"])
+            print(f"   Unique preferences found: {len(unique_prefs)}")
         
         # For EPIC_insight and EPIC_insight_combined: single FAISS with metadata
         elif self.method in ["EPIC_insight", "EPIC_insight_combined"]:

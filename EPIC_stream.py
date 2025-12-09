@@ -110,7 +110,7 @@ class StreamSetup:
     
     def _llm_filter_chunk(self, chunk, relevant_preferences):
         """
-        LLM filtering to decide Keep/Discard for a chunk
+        LLM filtering to decide Keep/Discard for a chunk using utils.process_chunk_rand_prefs
         
         Args:
             chunk: Document chunk text
@@ -120,43 +120,37 @@ class StreamSetup:
             tuple: (keep: bool, filtered_preferences: list, reason: str)
         """
         try:
-            # Format preferences for prompt
-            preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(relevant_preferences)])
-            
             # Load filtering prompts based on method
-            if self.method == "EPIC_insight_combined":
-                system_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_system)
-                user_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_user)
-            elif self.method == "EPIC_insight":
-                system_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_system)
-                user_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_user)
-            else:
-                # Default filtering prompt
+            if self.method == "EPIC_insight":
+                system_prompt = self.utils.load_prompt_template(self.utils.filtering_system)
+                user_prompt = self.utils.load_prompt_template(self.utils.filtering_user)
+            else:  # EPIC_inst
                 system_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_system)
                 user_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_user)
             
-            filled_prompt = self.utils.format_prompt(user_prompt, preference_text, chunk)
-            
-            response = self.utils.generate_message_vllm(
-                messages=[{"role": "user", "content": filled_prompt}],
-                system_prompt=system_prompt,
-                max_tokens=512
+            # Use utils.process_chunk_rand_prefs
+            result = self.utils.process_chunk_rand_prefs(
+                idx=0,  # Not used for single chunk
+                chunk_text=chunk,
+                preference_text="",  # Will be formatted inside
+                prompt_template=user_prompt,
+                prompt_template_system=system_prompt,
+                preference_list=relevant_preferences
             )
             
-            if response is None:
-                return False, [], "LLM returned None"
+            if result.get("status") != "success":
+                return False, [], result.get("reason", "Processing failed")
             
-            # Parse decision
-            decision, reason, preferences = self.utils.parse_decision_and_reason_preferences(response)
+            decision = result.get("decision", "Filter")
+            reason = result.get("reason", "")
+            preferences = result.get("relevant_preference", [])
             
-            # Map numbered preferences to actual text
-            if preferences:
-                mapped_prefs = []
-                for pref in preferences:
-                    mapped = self.utils.map_preference_numbers_to_text(pref, relevant_preferences)
-                    if mapped:
-                        mapped_prefs.append(mapped)
-                preferences = mapped_prefs
+            # Map Rewrite to Keep (for insight methods)
+            if self.method == "EPIC_insight":
+                if decision == "Rewrite":
+                    decision = "Keep"
+                elif decision == "Filter":
+                    decision = "Discard"
             
             keep = decision == "Keep"
             return keep, preferences if preferences else [], reason
@@ -164,93 +158,6 @@ class StreamSetup:
         except Exception as e:
             print(f"LLM filtering failed: {e}")
             return False, [], f"Error: {str(e)}"
-    
-    def _generate_insight_for_chunk(self, chunk, relevant_preferences, reason=""):
-        """
-        Generate insight for a single chunk using LLM
-        
-        Args:
-            chunk: Document chunk text
-            relevant_preferences: List of relevant preference texts
-            reason: Reason from filtering step
-        
-        Returns:
-            str: Generated insight
-        """
-        try:
-            preference_text = "\n".join([f"- {p}" for p in relevant_preferences])
-            
-            system_prompt = self.utils.load_prompt_template(self.utils.insight_system)
-            user_prompt = self.utils.load_prompt_template(self.utils.insight_user)
-            
-            filled_prompt = user_prompt.format(
-                preference=preference_text, 
-                chunk=chunk, 
-                reason=reason if reason else "Matched by LLM filtering"
-            )
-            
-            response = self.utils.generate_message_vllm(
-                messages=[{"role": "user", "content": filled_prompt}],
-                system_prompt=system_prompt,
-                max_tokens=256
-            )
-            
-            if response:
-                insight = self.utils.parse_insight(response)
-                return insight if insight else f"Relevant to: {preference_text[:100]}..."
-            else:
-                return f"Relevant to: {preference_text[:100]}..."
-                
-        except Exception as e:
-            print(f"Insight generation failed: {e}")
-            return f"Relevant to: {', '.join(relevant_preferences)[:100]}..."
-    
-    def _llm_filter_and_insight_combined(self, chunk, relevant_preferences):
-        """
-        Combined LLM call for filtering and insight generation (for EPIC_insight_combined)
-        
-        Args:
-            chunk: Document chunk text
-            relevant_preferences: List of relevant preference texts
-        
-        Returns:
-            tuple: (keep: bool, filtered_preferences: list, insight: str)
-        """
-        try:
-            preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(relevant_preferences)])
-            
-            system_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_system)
-            user_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_user)
-            
-            filled_prompt = self.utils.format_prompt(user_prompt, preference_text, chunk)
-            
-            response = self.utils.generate_message_vllm(
-                messages=[{"role": "user", "content": filled_prompt}],
-                system_prompt=system_prompt,
-                max_tokens=512
-            )
-            
-            if response is None:
-                return False, [], ""
-            
-            # Parse decision, reason, preferences, and insight
-            decision, reason, preferences, insight = self.utils.parse_decision_reason_insight(response)
-            
-            # Map numbered preferences to actual text
-            if preferences:
-                mapped_prefs = []
-                for pref in preferences:
-                    mapped = self.utils.map_preference_numbers_to_text(pref, relevant_preferences)
-                    if mapped:
-                        mapped_prefs.append(mapped)
-                preferences = mapped_prefs
-            
-            keep = decision == "Keep"
-            return keep, preferences if preferences else [], insight if insight else ""
-            
-        except Exception as e:
-            print(f"Combined LLM filter+insight failed: {e}")
-            return False, [], ""
     
     def add_preference(self, preference_text, source_persona_index=None):
         """
@@ -453,8 +360,17 @@ class StreamSetup:
                     
                     # For insight methods: generate insight using LLM
                     insight = None
-                    if self.method in ["EPIC_insight", "EPIC_insight_combined"]:
-                        insight = self._generate_insight_for_chunk(chunk, relevant_prefs)
+                    if self.method == "EPIC_insight":
+                        # Use utils.insight_single
+                        entry = {
+                            "chunk": chunk,
+                            "relevant_preference": relevant_prefs,
+                            "reason": "Matched by cosine filtering"
+                        }
+                        insight_prompt_user = self.utils.load_prompt_template(self.utils.insight_user)
+                        insight_prompt_system = self.utils.load_prompt_template(self.utils.insight_system)
+                        insight_result = self.utils.insight_single(entry, insight_prompt_user, insight_prompt_system)
+                        insight = insight_result.get("insight", "")
                         kept_insights.append(insight)
                     
                     kept_chunks.append(chunk)
@@ -493,7 +409,7 @@ class StreamSetup:
         
         return result
     
-    def _add_chunks_to_index(self, chunks, embeddings, preferences_list, insights=None):
+    def _add_chunks_to_index(self, chunks, embeddings, preferences_list, insights=None, instructions=None):
         """
         Incrementally add chunks to FAISS index with metadata
         
@@ -501,7 +417,8 @@ class StreamSetup:
             chunks: List of chunk texts
             embeddings: List of embedding vectors
             preferences_list: List of relevant preferences for each chunk
-            insights: Optional list of insights for each chunk
+            insights: Optional list of insights for each chunk (for EPIC_insight)
+            instructions: Optional list of instructions for each chunk (for EPIC_inst)
         """
         if not chunks:
             return
@@ -518,15 +435,22 @@ class StreamSetup:
         for i, (chunk, prefs) in enumerate(zip(chunks, preferences_list)):
             chunk_id = start_id + i
             insight = insights[i] if insights and i < len(insights) else None
+            instruction = instructions[i] if instructions and i < len(instructions) else None
             
             metadata = {
                 "id": chunk_id,
                 "text": chunk,  # "text" to match indexing
-                "insight": insight,
                 "relevant_preferences": prefs,  # "relevant_preferences" to match indexing
                 "active": True,
                 "added_at_docs": self.stream_meta["total_docs_processed"]
             }
+            
+            # Add method-specific fields
+            if insight:
+                metadata["insight"] = insight
+            if instruction:
+                metadata["instruction"] = instruction
+            
             self.chunk_metadata.append(metadata)
             
             # Update preference_to_chunks mapping
@@ -612,7 +536,7 @@ class StreamSetup:
         checkpoint_dir = os.path.join(method_dir, f"checkpoint_{checkpoint_id}")
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # Save active chunks (with insights if available)
+        # Save active chunks (with insights/instructions if available)
         kept_file = os.path.join(checkpoint_dir, "kept.jsonl")
         active_chunks = []
         with open(kept_file, 'w', encoding='utf-8') as f:
@@ -621,6 +545,8 @@ class StreamSetup:
                     item = {"text": meta["text"], "id": meta["id"]}
                     if meta.get("insight"):
                         item["insight"] = meta["insight"]
+                    if meta.get("instruction"):
+                        item["instruction"] = meta["instruction"]
                     item["relevant_preferences"] = meta["relevant_preferences"]
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
                     active_chunks.append(meta["text"])
@@ -1005,55 +931,63 @@ class StreamSetup:
         # Step 2: LLM Filtering (Keep/Discard)
         # ============================================
         # For methods that need LLM filtering
-        if self.method in ["EPIC_insight", "EPIC_insight_combined", "EPIC_inst", "EPIC_inst_combined"]:
-            if self.method == "EPIC_insight_combined":
-                # Combined: LLM filtering + insight in one call
-                llm_keep, llm_prefs, insight = self._llm_filter_and_insight_combined(chunk, cosine_relevant_prefs)
-                
-                if not llm_keep:
-                    return  # Discard
-                
-                # Use LLM-filtered preferences, or fall back to cosine prefs
-                final_prefs = llm_prefs if llm_prefs else cosine_relevant_prefs
-                
-            elif self.method == "EPIC_insight":
-                # Separate: LLM filtering first, then insight generation
-                llm_keep, llm_prefs, reason = self._llm_filter_chunk(chunk, cosine_relevant_prefs)
-                
-                if not llm_keep:
-                    return  # Discard
-                
-                final_prefs = llm_prefs if llm_prefs else cosine_relevant_prefs
-                
-                # Generate insight separately
-                insight = self._generate_insight_for_chunk(chunk, final_prefs, reason)
-            else:
-                # EPIC_inst, EPIC_inst_combined - just filtering, no insight
-                llm_keep, llm_prefs, reason = self._llm_filter_chunk(chunk, cosine_relevant_prefs)
-                
-                if not llm_keep:
-                    return  # Discard
-                
-                final_prefs = llm_prefs if llm_prefs else cosine_relevant_prefs
+        if self.method in ["EPIC_insight", "EPIC_inst"]:
+            llm_keep, llm_prefs, reason = self._llm_filter_chunk(chunk, cosine_relevant_prefs)
+            
+            if not llm_keep:
+                return  # Discard
+            
+            final_prefs = llm_prefs if llm_prefs else cosine_relevant_prefs
+            
+            # Generate insight or instruction using utils functions
+            if self.method == "EPIC_insight":
+                # Use utils.insight_single
+                entry = {
+                    "chunk": chunk,
+                    "relevant_preference": final_prefs,
+                    "reason": reason if reason else "Matched by LLM filtering"
+                }
+                insight_prompt_user = self.utils.load_prompt_template(self.utils.insight_user)
+                insight_prompt_system = self.utils.load_prompt_template(self.utils.insight_system)
+                insight_result = self.utils.insight_single(entry, insight_prompt_user, insight_prompt_system)
+                insight = insight_result.get("insight", "")
+                instruction = None
+            else:  # EPIC_inst
+                # Use utils.inst_single
+                entry = {
+                    "chunk": chunk,
+                    "relevant_preference": final_prefs,
+                    "reason": reason if reason else "Matched by LLM filtering"
+                }
+                inst_prompt_user = self.utils.load_prompt_template(self.utils.inst_user)
+                inst_prompt_system = self.utils.load_prompt_template(self.utils.inst_system)
+                inst_result = self.utils.inst_single(entry, inst_prompt_user, inst_prompt_system)
+                instruction = inst_result.get("instruction", "")
                 insight = None
         else:
             # For cosine-only method, no LLM filtering
             final_prefs = cosine_relevant_prefs
             insight = None
+            instruction = None
         
         # ============================================
         # Step 3: Add to FAISS Index
         # ============================================
         # For insight methods: use insight embedding for FAISS
-        if self.method in ["EPIC_insight", "EPIC_insight_combined"] and insight:
+        if self.method == "EPIC_insight" and insight:
             insight_emb = self.utils.embed_query_mp(insight)
             insight_emb = insight_emb / np.linalg.norm(insight_emb, axis=1, keepdims=True)
-            self._add_single_chunk_to_index(chunk, insight_emb.squeeze(0), final_prefs, insight)
+            self._add_single_chunk_to_index(chunk, insight_emb.squeeze(0), final_prefs, insight, instruction)
+        elif self.method == "EPIC_inst" and instruction:
+            # For inst methods: use instruction embedding for FAISS
+            instruction_emb = self.utils.embed_query_mp(instruction)
+            instruction_emb = instruction_emb / np.linalg.norm(instruction_emb, axis=1, keepdims=True)
+            self._add_single_chunk_to_index(chunk, instruction_emb.squeeze(0), final_prefs, insight, instruction)
         else:
             # For other methods: use chunk embedding
-            self._add_single_chunk_to_index(chunk, emb_norm, final_prefs, insight)
+            self._add_single_chunk_to_index(chunk, emb_norm, final_prefs, insight, instruction)
     
-    def _add_single_chunk_to_index(self, chunk, embedding, preferences, insight=None):
+    def _add_single_chunk_to_index(self, chunk, embedding, preferences, insight=None, instruction=None):
         """
         Add a single chunk to the FAISS index
         
@@ -1061,7 +995,8 @@ class StreamSetup:
             chunk: Chunk text
             embedding: Normalized embedding vector
             preferences: List of relevant preferences
-            insight: Optional insight text
+            insight: Optional insight text (for EPIC_insight)
+            instruction: Optional instruction text (for EPIC_inst)
         """
         chunk_id = self.next_chunk_id
         
@@ -1074,11 +1009,17 @@ class StreamSetup:
         metadata = {
             "id": chunk_id,
             "text": chunk,  # "text" to match indexing
-            "insight": insight,
             "relevant_preferences": preferences,  # "relevant_preferences" to match indexing
             "active": True,
             "added_at_docs": self.stream_meta["total_docs_processed"]
         }
+        
+        # Add method-specific fields
+        if insight:
+            metadata["insight"] = insight
+        if instruction:
+            metadata["instruction"] = instruction
+        
         self.chunk_metadata.append(metadata)
         
         # Update preference_to_chunks mapping

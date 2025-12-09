@@ -8,17 +8,12 @@
 
 <task>
 Decide whether to Discard or Keep the given chunk based on alignment with the listed user preferences.
-If keeping, also extract a key insight from the chunk.
 
 Follow these rules:
 - If the chunk is unrelated, choose <decision>Discard</decision>.
-- If the chunk is relevant, choose <decision>Keep</decision>, include matched <relevant_preferences>, and provide an <insight>.
-- The <insight> should capture what this chunk reveals that's valuable for the user's preferences.
+- If the chunk is relevant, choose <decision>Keep</decision>, and include matched <relevant_preferences>.
 - Always include a <reason> explaining the decision.
-- Output only a single <answer> XML block in strict XML format.
+- Output only a single <answer> XML block in strict XML format, with no extra explanation or commentary.
 </task>
 
 <answer>
-
-</output>
-
