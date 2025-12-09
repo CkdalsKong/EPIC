@@ -6,3 +6,8 @@ __pycache__/
 .idea/
 sampled*
 lmsys_chat1m_*
+
+# Docker files (local only)
+Dockerfile
+docker_init.sh
+run_docker.sh
