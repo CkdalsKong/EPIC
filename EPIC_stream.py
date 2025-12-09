@@ -21,6 +21,8 @@ class StreamSetup:
     """
     Stream-based evaluation setup that processes documents in batches (e.g., 2000 docs)
     and evaluates performance at each checkpoint with dynamic preference management.
+    
+    Uses incremental FAISS updates with metadata management for efficiency.
     """
     
     def __init__(self, utils, batch_size=2000):
@@ -32,24 +34,27 @@ class StreamSetup:
         self.doc_mode = utils.doc_mode
         self.batch_size = batch_size  # Documents per batch (default: 2000)
         
-        # Stream state
-        self.current_chunks = []
-        self.current_embeddings = None
-        self.current_insights = []  # For insight methods
+        # Stream state - using metadata-based management
+        self.chunk_metadata = []  # [{id, text, insight, relevant_preferences, active}]
+        self.next_chunk_id = 0
+        self.faiss_index = None  # Single FAISS index with IDMap
+        self.embedding_dim = None
         self.checkpoint_results = []
         
         # Preference management
         self.active_preferences = []  # Currently active preferences
         self.inactive_preferences = []  # Removed/inactive preferences
         self.preference_history = []  # Log of preference changes
-        self.preference_documents = {}  # {preference: [doc_indices]} mapping
+        self.preference_to_chunks = {}  # {preference: set(chunk_ids)} mapping
         
         # Stream metadata
         self.stream_meta = {
             "start_time": None,
             "checkpoints": [],
             "preference_events": [],
-            "total_docs_processed": 0
+            "total_docs_processed": 0,
+            "total_chunks_indexed": 0,
+            "active_chunks": 0
         }
     
     def initialize_stream(self, persona_index, all_chunks, all_embeddings):
@@ -66,17 +71,32 @@ class StreamSetup:
         self._compute_preference_embeddings()
         
         # Reset stream state
-        self.current_chunks = []
-        self.current_embeddings = None
-        self.current_insights = []
+        self.chunk_metadata = []
+        self.next_chunk_id = 0
         self.checkpoint_results = []
+        self.preference_to_chunks = {pref: set() for pref in self.active_preferences}
+        
+        # Initialize FAISS index with IDMap for incremental updates
+        self.embedding_dim = all_embeddings.shape[1] if len(all_embeddings) > 0 else 768
+        self._init_faiss_index(self.embedding_dim)
+        
+        # Reset metadata
         self.stream_meta["start_time"] = datetime.now().isoformat()
         self.stream_meta["total_docs_processed"] = 0
+        self.stream_meta["total_chunks_indexed"] = 0
+        self.stream_meta["active_chunks"] = 0
         
         print(f"✅ Stream initialized for persona {persona_index}")
         print(f"   Total documents available: {len(all_chunks)}")
         print(f"   Active preferences: {len(self.active_preferences)}")
         print(f"   Batch size: {self.batch_size}")
+        print(f"   FAISS index: IndexIDMap (incremental updates enabled)")
+    
+    def _init_faiss_index(self, dim):
+        """Initialize FAISS index with IDMap for incremental updates and potential deletions"""
+        base_index = faiss.IndexFlatIP(dim)
+        self.faiss_index = faiss.IndexIDMap(base_index)
+        print(f"✅ Initialized FAISS IndexIDMap with dimension {dim}")
     
     def _compute_preference_embeddings(self):
         """Compute embeddings for active preferences"""
@@ -88,13 +108,71 @@ class StreamSetup:
         else:
             self.preference_embeddings = None
     
-    def _generate_insight_for_chunk(self, chunk, relevant_preferences):
+    def _llm_filter_chunk(self, chunk, relevant_preferences):
+        """
+        LLM filtering to decide Keep/Discard for a chunk
+        
+        Args:
+            chunk: Document chunk text
+            relevant_preferences: List of relevant preference texts (from cosine filtering)
+        
+        Returns:
+            tuple: (keep: bool, filtered_preferences: list, reason: str)
+        """
+        try:
+            # Format preferences for prompt
+            preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(relevant_preferences)])
+            
+            # Load filtering prompts based on method
+            if self.method == "EPIC_insight_combined":
+                system_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_system)
+                user_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_user)
+            elif self.method == "EPIC_insight":
+                system_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_system)
+                user_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_user)
+            else:
+                # Default filtering prompt
+                system_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_system)
+                user_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_user)
+            
+            filled_prompt = self.utils.format_prompt(user_prompt, preference_text, chunk)
+            
+            response = self.utils.generate_message_vllm(
+                messages=[{"role": "user", "content": filled_prompt}],
+                system_prompt=system_prompt,
+                max_tokens=512
+            )
+            
+            if response is None:
+                return False, [], "LLM returned None"
+            
+            # Parse decision
+            decision, reason, preferences = self.utils.parse_decision_and_reason_preferences(response)
+            
+            # Map numbered preferences to actual text
+            if preferences:
+                mapped_prefs = []
+                for pref in preferences:
+                    mapped = self.utils.map_preference_numbers_to_text(pref, relevant_preferences)
+                    if mapped:
+                        mapped_prefs.append(mapped)
+                preferences = mapped_prefs
+            
+            keep = decision == "Keep"
+            return keep, preferences if preferences else [], reason
+            
+        except Exception as e:
+            print(f"LLM filtering failed: {e}")
+            return False, [], f"Error: {str(e)}"
+    
+    def _generate_insight_for_chunk(self, chunk, relevant_preferences, reason=""):
         """
         Generate insight for a single chunk using LLM
         
         Args:
             chunk: Document chunk text
             relevant_preferences: List of relevant preference texts
+            reason: Reason from filtering step
         
         Returns:
             str: Generated insight
@@ -102,18 +180,13 @@ class StreamSetup:
         try:
             preference_text = "\n".join([f"- {p}" for p in relevant_preferences])
             
-            # Use insight_combined prompt for efficiency
-            if self.method == "EPIC_insight_combined":
-                system_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_system)
-                user_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_user)
-            else:
-                system_prompt = self.utils.load_prompt_template(self.utils.insight_system)
-                user_prompt = self.utils.load_prompt_template(self.utils.insight_user)
+            system_prompt = self.utils.load_prompt_template(self.utils.insight_system)
+            user_prompt = self.utils.load_prompt_template(self.utils.insight_user)
             
             filled_prompt = user_prompt.format(
                 preference=preference_text, 
                 chunk=chunk, 
-                reason="Matched by cosine similarity"
+                reason=reason if reason else "Matched by LLM filtering"
             )
             
             response = self.utils.generate_message_vllm(
@@ -132,6 +205,53 @@ class StreamSetup:
             print(f"Insight generation failed: {e}")
             return f"Relevant to: {', '.join(relevant_preferences)[:100]}..."
     
+    def _llm_filter_and_insight_combined(self, chunk, relevant_preferences):
+        """
+        Combined LLM call for filtering and insight generation (for EPIC_insight_combined)
+        
+        Args:
+            chunk: Document chunk text
+            relevant_preferences: List of relevant preference texts
+        
+        Returns:
+            tuple: (keep: bool, filtered_preferences: list, insight: str)
+        """
+        try:
+            preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(relevant_preferences)])
+            
+            system_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_system)
+            user_prompt = self.utils.load_prompt_template(self.utils.filtering_insight_user)
+            
+            filled_prompt = self.utils.format_prompt(user_prompt, preference_text, chunk)
+            
+            response = self.utils.generate_message_vllm(
+                messages=[{"role": "user", "content": filled_prompt}],
+                system_prompt=system_prompt,
+                max_tokens=512
+            )
+            
+            if response is None:
+                return False, [], ""
+            
+            # Parse decision, reason, preferences, and insight
+            decision, reason, preferences, insight = self.utils.parse_decision_reason_insight(response)
+            
+            # Map numbered preferences to actual text
+            if preferences:
+                mapped_prefs = []
+                for pref in preferences:
+                    mapped = self.utils.map_preference_numbers_to_text(pref, relevant_preferences)
+                    if mapped:
+                        mapped_prefs.append(mapped)
+                preferences = mapped_prefs
+            
+            keep = decision == "Keep"
+            return keep, preferences if preferences else [], insight if insight else ""
+            
+        except Exception as e:
+            print(f"Combined LLM filter+insight failed: {e}")
+            return False, [], ""
+    
     def add_preference(self, preference_text, source_persona_index=None):
         """
         Add a new preference (from another persona or custom)
@@ -145,11 +265,31 @@ class StreamSetup:
             return False
         
         # If it was inactive, reactivate it
+        reactivated_count = 0
         if preference_text in self.inactive_preferences:
             self.inactive_preferences.remove(preference_text)
+            
+            # Reactivate chunks that belong to this preference
+            if preference_text in self.preference_to_chunks:
+                chunk_ids = self.preference_to_chunks[preference_text]
+                for chunk_id in chunk_ids:
+                    if chunk_id < len(self.chunk_metadata):
+                        meta = self.chunk_metadata[chunk_id]
+                        if not meta["active"]:
+                            meta["active"] = True
+                            meta["reactivated_at_docs"] = self.stream_meta["total_docs_processed"]
+                            reactivated_count += 1
         
         self.active_preferences.append(preference_text)
         self._compute_preference_embeddings()
+        
+        # Initialize preference_to_chunks if new preference
+        if preference_text not in self.preference_to_chunks:
+            self.preference_to_chunks[preference_text] = set()
+        
+        # Update active chunks count
+        active_count = sum(1 for m in self.chunk_metadata if m["active"])
+        self.stream_meta["active_chunks"] = active_count
         
         # Log the event
         event = {
@@ -157,13 +297,17 @@ class StreamSetup:
             "preference": preference_text,
             "source_persona": source_persona_index,
             "timestamp": datetime.now().isoformat(),
-            "docs_processed": self.stream_meta["total_docs_processed"]
+            "docs_processed": self.stream_meta["total_docs_processed"],
+            "chunks_reactivated": reactivated_count
         }
         self.preference_history.append(event)
         self.stream_meta["preference_events"].append(event)
         
         print(f"✅ Added preference: {preference_text[:50]}...")
+        if reactivated_count > 0:
+            print(f"   Reactivated {reactivated_count} chunks")
         print(f"   Active preferences: {len(self.active_preferences)}")
+        print(f"   Active chunks: {active_count}")
         return True
     
     def remove_preference(self, preference_text):
@@ -181,25 +325,42 @@ class StreamSetup:
         self.inactive_preferences.append(preference_text)
         self._compute_preference_embeddings()
         
-        # Mark related documents as inactive in preference_documents
-        if preference_text in self.preference_documents:
-            self.preference_documents[preference_text] = {
-                "indices": self.preference_documents[preference_text].get("indices", []),
-                "status": "inactive"
-            }
+        # Deactivate chunks that ONLY belong to this preference
+        deactivated_count = 0
+        if preference_text in self.preference_to_chunks:
+            chunk_ids = self.preference_to_chunks[preference_text]
+            for chunk_id in chunk_ids:
+                if chunk_id < len(self.chunk_metadata):
+                    meta = self.chunk_metadata[chunk_id]
+                    # Check if chunk has other active preferences
+                    other_active_prefs = [p for p in meta["relevant_preferences"] 
+                                         if p in self.active_preferences and p != preference_text]
+                    if not other_active_prefs:
+                        # No other active preferences, deactivate this chunk
+                        meta["active"] = False
+                        meta["deactivated_at_docs"] = self.stream_meta["total_docs_processed"]
+                        meta["deactivated_reason"] = f"Preference removed: {preference_text[:50]}..."
+                        deactivated_count += 1
+        
+        # Update active chunks count
+        active_count = sum(1 for m in self.chunk_metadata if m["active"])
+        self.stream_meta["active_chunks"] = active_count
         
         # Log the event
         event = {
             "type": "remove",
             "preference": preference_text,
             "timestamp": datetime.now().isoformat(),
-            "docs_processed": self.stream_meta["total_docs_processed"]
+            "docs_processed": self.stream_meta["total_docs_processed"],
+            "chunks_deactivated": deactivated_count
         }
         self.preference_history.append(event)
         self.stream_meta["preference_events"].append(event)
         
         print(f"❌ Removed preference: {preference_text[:50]}...")
+        print(f"   Deactivated {deactivated_count} chunks")
         print(f"   Active preferences: {len(self.active_preferences)}")
+        print(f"   Active chunks: {active_count}")
         return True
     
     def get_random_preference_from_other_persona(self, exclude_persona_index=None):
@@ -222,6 +383,8 @@ class StreamSetup:
             all_indices = list(range(90))
         elif self.utils.dataset_name == "PrefELI5":
             all_indices = list(range(73))
+        elif self.utils.dataset_name == "PrefEval":
+            all_indices = list(range(57))
         else:
             all_indices = list(range(10))
         
@@ -251,7 +414,7 @@ class StreamSetup:
     
     def process_batch(self, start_idx, end_idx):
         """
-        Process a batch of documents
+        Process a batch of documents with incremental FAISS updates
         
         Args:
             start_idx: Start index in all_chunks
@@ -272,7 +435,8 @@ class StreamSetup:
         # Filter based on preference similarity (cosine filtering)
         kept_chunks = []
         kept_embeddings = []
-        kept_insights = []  # For insight methods
+        kept_insights = []
+        kept_preferences = []  # List of relevant preferences for each kept chunk
         filtered_count = 0
         
         if self.preference_embeddings is not None and len(self.active_preferences) > 0:
@@ -288,37 +452,31 @@ class StreamSetup:
                     relevant_prefs = [self.active_preferences[idx] for idx in relevant_pref_indices]
                     
                     # For insight methods: generate insight using LLM
+                    insight = None
                     if self.method in ["EPIC_insight", "EPIC_insight_combined"]:
                         insight = self._generate_insight_for_chunk(chunk, relevant_prefs)
                         kept_insights.append(insight)
                     
                     kept_chunks.append(chunk)
                     kept_embeddings.append(emb)
-                    
-                    for pref_idx in relevant_pref_indices:
-                        pref = self.active_preferences[pref_idx]
-                        if pref not in self.preference_documents:
-                            self.preference_documents[pref] = {"indices": [], "status": "active"}
-                        self.preference_documents[pref]["indices"].append(len(self.current_chunks) + len(kept_chunks) - 1)
+                    kept_preferences.append(relevant_prefs)
                 else:
                     filtered_count += 1
         else:
             kept_chunks = batch_chunks
             kept_embeddings = list(batch_embeddings_norm)
+            kept_preferences = [self.active_preferences[:] for _ in batch_chunks]
         
-        # Add to current stream
-        self.current_chunks.extend(kept_chunks)
-        if kept_insights:
-            self.current_insights.extend(kept_insights)
-        if self.current_embeddings is None:
-            self.current_embeddings = np.array(kept_embeddings) if kept_embeddings else None
-        elif kept_embeddings:
-            self.current_embeddings = np.vstack([self.current_embeddings, np.array(kept_embeddings)])
+        # Incrementally add to FAISS index and metadata
+        if kept_chunks:
+            self._add_chunks_to_index(kept_chunks, kept_embeddings, kept_preferences, kept_insights)
         
         batch_time = time.time() - batch_start_time
         
         # Update metadata
         self.stream_meta["total_docs_processed"] += len(batch_chunks)
+        active_count = sum(1 for m in self.chunk_metadata if m["active"])
+        self.stream_meta["active_chunks"] = active_count
         
         result = {
             "start_idx": start_idx,
@@ -327,25 +485,110 @@ class StreamSetup:
             "kept_count": len(kept_chunks),
             "filtered_count": filtered_count,
             "processing_time": batch_time,
-            "total_accumulated": len(self.current_chunks)
+            "total_indexed": len(self.chunk_metadata),
+            "total_active": active_count
         }
         
-        print(f"📦 Batch [{start_idx}:{end_idx}] - Kept: {len(kept_chunks)}, Filtered: {filtered_count}, Total: {len(self.current_chunks)}")
+        print(f"📦 Batch [{start_idx}:{end_idx}] - Kept: {len(kept_chunks)}, Filtered: {filtered_count}, Total indexed: {len(self.chunk_metadata)}, Active: {active_count}")
         
         return result
     
-    def build_index(self):
-        """Build FAISS index from current accumulated chunks"""
-        if self.current_embeddings is None or len(self.current_embeddings) == 0:
-            print("⚠️ No embeddings to build index from")
+    def _add_chunks_to_index(self, chunks, embeddings, preferences_list, insights=None):
+        """
+        Incrementally add chunks to FAISS index with metadata
+        
+        Args:
+            chunks: List of chunk texts
+            embeddings: List of embedding vectors
+            preferences_list: List of relevant preferences for each chunk
+            insights: Optional list of insights for each chunk
+        """
+        if not chunks:
+            return
+        
+        # Prepare IDs and embeddings for FAISS
+        start_id = self.next_chunk_id
+        ids = np.arange(start_id, start_id + len(chunks), dtype=np.int64)
+        emb_array = np.array(embeddings).astype(np.float32)
+        
+        # Add to FAISS index
+        self.faiss_index.add_with_ids(emb_array, ids)
+        
+        # Add metadata for each chunk
+        for i, (chunk, prefs) in enumerate(zip(chunks, preferences_list)):
+            chunk_id = start_id + i
+            insight = insights[i] if insights and i < len(insights) else None
+            
+            metadata = {
+                "id": chunk_id,
+                "text": chunk,  # "text" to match indexing
+                "insight": insight,
+                "relevant_preferences": prefs,  # "relevant_preferences" to match indexing
+                "active": True,
+                "added_at_docs": self.stream_meta["total_docs_processed"]
+            }
+            self.chunk_metadata.append(metadata)
+            
+            # Update preference_to_chunks mapping
+            for pref in prefs:
+                if pref not in self.preference_to_chunks:
+                    self.preference_to_chunks[pref] = set()
+                self.preference_to_chunks[pref].add(chunk_id)
+        
+        self.next_chunk_id += len(chunks)
+        self.stream_meta["total_chunks_indexed"] = len(self.chunk_metadata)
+    
+    def get_index(self):
+        """Get the current FAISS index (no rebuild needed with incremental updates)"""
+        if self.faiss_index is None or self.faiss_index.ntotal == 0:
+            print("⚠️ No embeddings in index")
             return None
         
-        dim = self.current_embeddings.shape[1]
-        index = faiss.IndexFlatIP(dim)
-        index.add(self.current_embeddings.astype(np.float32))
+        active_count = sum(1 for m in self.chunk_metadata if m["active"])
+        print(f"✅ Using FAISS index with {self.faiss_index.ntotal} vectors ({active_count} active)")
+        return self.faiss_index
+    
+    def search_active_chunks(self, query_emb, top_k=5):
+        """
+        Search FAISS index and return only active chunks
         
-        print(f"✅ Built FAISS index with {len(self.current_embeddings)} vectors")
-        return index
+        Args:
+            query_emb: Query embedding vector
+            top_k: Number of results to return
+        
+        Returns:
+            list: Top-k active chunks
+        """
+        if self.faiss_index is None or self.faiss_index.ntotal == 0:
+            return []
+        
+        # Search more than top_k to account for inactive chunks
+        search_k = min(top_k * 3, self.faiss_index.ntotal)
+        D, I = self.faiss_index.search(query_emb.astype(np.float32), search_k)
+        
+        results = []
+        for idx in I[0]:
+            if idx >= 0 and idx < len(self.chunk_metadata):
+                meta = self.chunk_metadata[idx]
+                if meta["active"]:
+                    results.append(meta["text"])
+                    if len(results) >= top_k:
+                        break
+        
+        return results
+    
+    def get_active_chunks(self):
+        """Get list of all active chunks"""
+        return [m["text"] for m in self.chunk_metadata if m["active"]]
+    
+    def get_active_chunks_with_insights(self):
+        """Get list of all active chunks with their insights"""
+        return [(m["text"], m.get("insight", "")) for m in self.chunk_metadata if m["active"]]
+    
+    # Alias for backward compatibility
+    def build_index(self):
+        """Alias for get_index() - maintained for backward compatibility"""
+        return self.get_index()
     
     def run_checkpoint_evaluation(self, checkpoint_id, method_dir):
         """
@@ -360,8 +603,8 @@ class StreamSetup:
         """
         print(f"\n🔍 Running checkpoint evaluation #{checkpoint_id}...")
         
-        # Build index from current chunks
-        index = self.build_index()
+        # Get existing FAISS index (no rebuild needed)
+        index = self.get_index()
         if index is None:
             return None
         
@@ -369,27 +612,33 @@ class StreamSetup:
         checkpoint_dir = os.path.join(method_dir, f"checkpoint_{checkpoint_id}")
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # Save kept chunks (with insights if available)
+        # Save active chunks (with insights if available)
         kept_file = os.path.join(checkpoint_dir, "kept.jsonl")
+        active_chunks = []
         with open(kept_file, 'w', encoding='utf-8') as f:
-            for i, chunk in enumerate(self.current_chunks):
-                item = {"text": chunk}
-                if self.method in ["EPIC_insight", "EPIC_insight_combined"] and i < len(self.current_insights):
-                    item["insight"] = self.current_insights[i]
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            for meta in self.chunk_metadata:
+                if meta["active"]:
+                    item = {"text": meta["text"], "id": meta["id"]}
+                    if meta.get("insight"):
+                        item["insight"] = meta["insight"]
+                    item["relevant_preferences"] = meta["relevant_preferences"]
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    active_chunks.append(meta["text"])
         
         # Run generation for a subset of queries
-        generation_results = self._run_generation(index, checkpoint_dir)
+        generation_results = self._run_generation(index, checkpoint_dir, active_chunks)
         
         # Run evaluation on generated results
         evaluation_stats = self._run_evaluation(generation_results, checkpoint_dir)
         
         # Calculate metrics
         total = len(generation_results) if generation_results else 1
+        active_count = len(active_chunks)
         metrics = {
             "checkpoint_id": checkpoint_id,
             "docs_processed": self.stream_meta["total_docs_processed"],
-            "active_chunks": len(self.current_chunks),
+            "total_indexed": len(self.chunk_metadata),
+            "active_chunks": active_count,
             "active_preferences": len(self.active_preferences),
             "unhelpful": evaluation_stats.get("error_unhelpful", 0),
             "inconsistent": evaluation_stats.get("error_inconsistent", 0),
@@ -406,14 +655,19 @@ class StreamSetup:
         self._save_checkpoint_results(checkpoint_dir, metrics)
         
         print(f"✅ Checkpoint #{checkpoint_id} evaluation complete")
+        print(f"   Total indexed: {len(self.chunk_metadata)}, Active: {active_count}")
         print(f"   Accuracy: {metrics['preference_following_accuracy']}%")
         
         return metrics
     
-    def _run_generation(self, index, checkpoint_dir):
+    def _run_generation(self, index, checkpoint_dir, active_chunks=None):
         """Run generation for current checkpoint"""
         generation_prompt = self.utils.load_prompt_template(self.utils.generation_prompt)
         all_results = []
+        
+        # Get active chunks if not provided
+        if active_chunks is None:
+            active_chunks = self.get_active_chunks()
         
         # Process each active preference block
         for block in self.persona["preference_blocks"]:
@@ -429,12 +683,20 @@ class StreamSetup:
                 question = query["question"]
                 
                 try:
-                    retrieved, retrieval_time = self.utils.retrieve_top_k_wq_cosine(
-                        question,
-                        self.active_preferences,
-                        index,
-                        self.current_chunks
-                    )
+                    start_retrieval = time.time()
+                    
+                    # Use active-aware retrieval
+                    retrieved = self._retrieve_active_chunks(question, self.utils.top_k)
+                    retrieval_time = time.time() - start_retrieval
+                    
+                    if not retrieved:
+                        # Fallback to standard retrieval if no results
+                        retrieved, retrieval_time = self.utils.retrieve_top_k_wq_cosine(
+                            question,
+                            self.active_preferences,
+                            index,
+                            active_chunks
+                        )
                     
                     context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved)])
                     filled_prompt = generation_prompt.replace("{context}", context).replace("{question}", question)
@@ -462,6 +724,31 @@ class StreamSetup:
         self.utils.save_json(gen_file, all_results)
         
         return all_results
+    
+    def _retrieve_active_chunks(self, question, top_k=5):
+        """
+        Retrieve top-k active chunks for a question
+        
+        Args:
+            question: Query question
+            top_k: Number of results
+        
+        Returns:
+            list: Retrieved chunk texts
+        """
+        # Compute query embedding
+        query_emb = self.utils.embed_query_mp(question)
+        
+        # Add preference weighting
+        if self.preference_embeddings is not None and len(self.active_preferences) > 0:
+            pref_sims = np.dot(self.preference_embeddings, query_emb.T).squeeze()
+            max_pref_idx = np.argmax(pref_sims)
+            pref_emb = self.utils.embed_query_mp(self.active_preferences[max_pref_idx])
+            query_emb = query_emb + pref_sims[max_pref_idx] * pref_emb
+            query_emb = query_emb / np.linalg.norm(query_emb, axis=1, keepdims=True)
+        
+        # Search and filter by active status
+        return self.search_active_chunks(query_emb, top_k)
     
     def _run_evaluation(self, generation_data, checkpoint_dir):
         """Run evaluation on generated results"""
@@ -571,35 +858,49 @@ class StreamSetup:
         self.utils.save_json(pref_state_file, {
             "active_preferences": self.active_preferences,
             "inactive_preferences": self.inactive_preferences,
-            "preference_history": self.preference_history
+            "preference_history": self.preference_history,
+            "preference_to_chunks_count": {k: len(v) for k, v in self.preference_to_chunks.items()}
+        })
+        
+        # Save chunk metadata summary
+        chunk_summary_file = os.path.join(checkpoint_dir, "chunk_summary.json")
+        active_count = sum(1 for m in self.chunk_metadata if m["active"])
+        inactive_count = len(self.chunk_metadata) - active_count
+        self.utils.save_json(chunk_summary_file, {
+            "total_indexed": len(self.chunk_metadata),
+            "active": active_count,
+            "inactive": inactive_count
         })
     
-    def run_stream(self, method_dir, preference_events=None):
+    def run_stream(self, method_dir, preference_events=None, checkpoint_interval=None):
         """
-        Run the full stream processing pipeline
+        Run the full stream processing pipeline (document-by-document)
         
         Args:
             method_dir: Output directory for results
             preference_events: Optional list of preference change events
                 Format: [{"type": "add"|"remove", "at_docs": int, "preference": str|None}]
                 If preference is None for "add", will get random from other persona
+            checkpoint_interval: Number of documents between checkpoints (default: batch_size)
         
         Returns:
             dict: Stream results with all checkpoint metrics
         """
         print(f"\n{'='*60}")
-        print(f"🚀 Starting Stream Processing")
+        print(f"🚀 Starting Stream Processing (Document-by-Document)")
         print(f"{'='*60}")
         
         stream_dir = os.path.join(method_dir, f"stream_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(stream_dir, exist_ok=True)
         
         total_docs = len(self.all_chunks)
-        num_batches = (total_docs + self.batch_size - 1) // self.batch_size
+        checkpoint_interval = checkpoint_interval or self.batch_size
+        num_checkpoints = (total_docs + checkpoint_interval - 1) // checkpoint_interval
         
         print(f"Total documents: {total_docs}")
-        print(f"Batch size: {self.batch_size}")
-        print(f"Number of batches: {num_batches}")
+        print(f"Processing: Document-by-document")
+        print(f"Checkpoint interval: Every {checkpoint_interval} documents")
+        print(f"Expected checkpoints: {num_checkpoints}")
         
         # Sort preference events by docs threshold
         if preference_events:
@@ -609,12 +910,11 @@ class StreamSetup:
         
         event_idx = 0
         checkpoint_id = 0
+        docs_since_checkpoint = 0
         
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * self.batch_size
-            end_idx = min(start_idx + self.batch_size, total_docs)
-            
-            # Check for preference events before this batch
+        # Process documents one by one
+        for doc_idx in tqdm(range(total_docs), desc="Processing documents"):
+            # Check for preference events
             while event_idx < len(preference_events):
                 event = preference_events[event_idx]
                 if event.get("at_docs", 0) <= self.stream_meta["total_docs_processed"]:
@@ -623,12 +923,21 @@ class StreamSetup:
                 else:
                     break
             
-            # Process batch
-            print(f"\n--- Batch {batch_idx + 1}/{num_batches} ---")
-            self.process_batch(start_idx, end_idx)
+            # Process single document
+            self._process_single_document(doc_idx)
+            docs_since_checkpoint += 1
             
-            # Run checkpoint evaluation after each batch
+            # Run checkpoint at intervals
+            if docs_since_checkpoint >= checkpoint_interval:
+                checkpoint_id += 1
+                print(f"\n--- Checkpoint {checkpoint_id} at {self.stream_meta['total_docs_processed']} docs ---")
+                self.run_checkpoint_evaluation(checkpoint_id, stream_dir)
+                docs_since_checkpoint = 0
+        
+        # Final checkpoint if there are remaining docs
+        if docs_since_checkpoint > 0:
             checkpoint_id += 1
+            print(f"\n--- Final Checkpoint {checkpoint_id} at {self.stream_meta['total_docs_processed']} docs ---")
             self.run_checkpoint_evaluation(checkpoint_id, stream_dir)
         
         # Save final stream results
@@ -645,6 +954,142 @@ class StreamSetup:
             "checkpoints": self.checkpoint_results,
             "metadata": self.stream_meta
         }
+    
+    def _process_single_document(self, doc_idx):
+        """
+        Process a single document and add to index if relevant
+        
+        Args:
+            doc_idx: Index of document in all_chunks
+            
+        Flow:
+            1. Cosine filtering - check if chunk is similar to any active preference
+            2. LLM filtering - ask LLM to decide Keep/Discard
+            3. If Keep -> Insight generation (for insight methods)
+            4. Add to FAISS index
+        """
+        chunk = self.all_chunks[doc_idx]
+        emb = self.all_embeddings[doc_idx]
+        
+        # Normalize embedding
+        emb_norm = emb / np.linalg.norm(emb)
+        
+        # Update processed count first
+        self.stream_meta["total_docs_processed"] += 1
+        
+        # ============================================
+        # Step 1: Cosine Filtering
+        # ============================================
+        cosine_passed = False
+        cosine_relevant_prefs = []
+        
+        if self.preference_embeddings is not None and len(self.active_preferences) > 0:
+            # Compute similarity with all active preferences
+            sims = np.dot(self.preference_embeddings, emb_norm)
+            above_threshold = sims > self.utils.threshold
+            
+            if np.any(above_threshold):
+                cosine_passed = True
+                relevant_pref_indices = np.where(above_threshold)[0]
+                cosine_relevant_prefs = [self.active_preferences[idx] for idx in relevant_pref_indices]
+        else:
+            # No preferences, keep all
+            cosine_passed = True
+            cosine_relevant_prefs = self.active_preferences[:]
+        
+        # If cosine filtering failed, skip this document
+        if not cosine_passed:
+            return
+        
+        # ============================================
+        # Step 2: LLM Filtering (Keep/Discard)
+        # ============================================
+        # For methods that need LLM filtering
+        if self.method in ["EPIC_insight", "EPIC_insight_combined", "EPIC_inst", "EPIC_inst_combined"]:
+            if self.method == "EPIC_insight_combined":
+                # Combined: LLM filtering + insight in one call
+                llm_keep, llm_prefs, insight = self._llm_filter_and_insight_combined(chunk, cosine_relevant_prefs)
+                
+                if not llm_keep:
+                    return  # Discard
+                
+                # Use LLM-filtered preferences, or fall back to cosine prefs
+                final_prefs = llm_prefs if llm_prefs else cosine_relevant_prefs
+                
+            elif self.method == "EPIC_insight":
+                # Separate: LLM filtering first, then insight generation
+                llm_keep, llm_prefs, reason = self._llm_filter_chunk(chunk, cosine_relevant_prefs)
+                
+                if not llm_keep:
+                    return  # Discard
+                
+                final_prefs = llm_prefs if llm_prefs else cosine_relevant_prefs
+                
+                # Generate insight separately
+                insight = self._generate_insight_for_chunk(chunk, final_prefs, reason)
+            else:
+                # EPIC_inst, EPIC_inst_combined - just filtering, no insight
+                llm_keep, llm_prefs, reason = self._llm_filter_chunk(chunk, cosine_relevant_prefs)
+                
+                if not llm_keep:
+                    return  # Discard
+                
+                final_prefs = llm_prefs if llm_prefs else cosine_relevant_prefs
+                insight = None
+        else:
+            # For cosine-only method, no LLM filtering
+            final_prefs = cosine_relevant_prefs
+            insight = None
+        
+        # ============================================
+        # Step 3: Add to FAISS Index
+        # ============================================
+        # For insight methods: use insight embedding for FAISS
+        if self.method in ["EPIC_insight", "EPIC_insight_combined"] and insight:
+            insight_emb = self.utils.embed_query_mp(insight)
+            insight_emb = insight_emb / np.linalg.norm(insight_emb, axis=1, keepdims=True)
+            self._add_single_chunk_to_index(chunk, insight_emb.squeeze(0), final_prefs, insight)
+        else:
+            # For other methods: use chunk embedding
+            self._add_single_chunk_to_index(chunk, emb_norm, final_prefs, insight)
+    
+    def _add_single_chunk_to_index(self, chunk, embedding, preferences, insight=None):
+        """
+        Add a single chunk to the FAISS index
+        
+        Args:
+            chunk: Chunk text
+            embedding: Normalized embedding vector
+            preferences: List of relevant preferences
+            insight: Optional insight text
+        """
+        chunk_id = self.next_chunk_id
+        
+        # Add to FAISS
+        emb_array = np.array([embedding]).astype(np.float32)
+        ids = np.array([chunk_id], dtype=np.int64)
+        self.faiss_index.add_with_ids(emb_array, ids)
+        
+        # Add metadata (field names match EPIC_indexing.py)
+        metadata = {
+            "id": chunk_id,
+            "text": chunk,  # "text" to match indexing
+            "insight": insight,
+            "relevant_preferences": preferences,  # "relevant_preferences" to match indexing
+            "active": True,
+            "added_at_docs": self.stream_meta["total_docs_processed"]
+        }
+        self.chunk_metadata.append(metadata)
+        
+        # Update preference_to_chunks mapping
+        for pref in preferences:
+            if pref not in self.preference_to_chunks:
+                self.preference_to_chunks[pref] = set()
+            self.preference_to_chunks[pref].add(chunk_id)
+        
+        self.next_chunk_id += 1
+        self.stream_meta["total_chunks_indexed"] = len(self.chunk_metadata)
+        self.stream_meta["active_chunks"] = sum(1 for m in self.chunk_metadata if m["active"])
     
     def _handle_preference_event(self, event):
         """Handle a preference change event"""
@@ -693,6 +1138,7 @@ class StreamSetup:
         fieldnames = [
             "checkpoint_id",
             "docs_processed",
+            "total_indexed",
             "active_chunks",
             "active_preferences",
             "unhelpful",
@@ -922,4 +1368,32 @@ class StreamManager:
             })
         
         return sorted(events, key=lambda x: x["at_docs"])
+    
+    def create_fixed_preference_events(self, batch_size=2000):
+        """
+        Create fixed preference events at specific checkpoints
+        
+        - 2nd checkpoint (after 2 batches): Remove one preference
+        - 4th checkpoint (after 4 batches): Add one preference
+        
+        Args:
+            batch_size: Batch size for determining event timing
+        
+        Returns:
+            list: Preference events
+        """
+        events = [
+            {
+                "type": "remove",
+                "at_docs": batch_size * 2,  # After 2nd batch (e.g., 4000 docs)
+                "preference": None  # Will remove random active preference
+            },
+            {
+                "type": "add",
+                "at_docs": batch_size * 4,  # After 4th batch (e.g., 8000 docs)
+                "preference": None  # Will get random from other persona
+            }
+        ]
+        
+        return events
 

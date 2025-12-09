@@ -143,17 +143,17 @@ class EPICMain:
         if self.mode == "stream":
             print("\n4. Starting stream processing...")
             print(f"   Batch size: {self.stream_batch_size}")
-            print(f"   Preference add events: {self.stream_num_add}")
-            print(f"   Preference remove events: {self.stream_num_remove}")
             
-            # Create preference events
-            total_docs = len(cached_resources["chunks"])
-            preference_events = self.stream_manager.create_random_preference_events(
-                num_add=self.stream_num_add, 
-                num_remove=self.stream_num_remove,
-                total_docs=total_docs,
+            # Create fixed preference events:
+            # - 2nd checkpoint: remove one preference
+            # - 4th checkpoint: add one preference
+            preference_events = self.stream_manager.create_fixed_preference_events(
                 batch_size=self.stream_batch_size
             )
+            
+            print(f"   Preference events:")
+            for event in preference_events:
+                print(f"      - {event['type'].upper()} at {event['at_docs']} docs")
             
             # Run stream experiment
             stream = self.stream_manager.run_stream_experiment(
@@ -177,7 +177,7 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output folder")
     parser.add_argument("--dataset", type=str, required=True, help="Path to the dataset file")
     parser.add_argument("--emb_model_name", type=str, default="facebook/contriever")
-    parser.add_argument("--doc_mode", type=str, required=True, choices=["wiki", "eli5", "wiki_total", "eli5_total"], help="Document mode: 'wiki' for PrefWiki, PrefRQ, 'eli5' for PrefELI5")
+    parser.add_argument("--doc_mode", type=str, required=True, choices=["wiki", "eli5", "wiki_total", "eli5_total", "lmsys", "lmsys_sampled"], help="Document mode: 'wiki' for PrefWiki, PrefRQ, 'eli5' for PrefELI5, 'lmsys' for PrefEval (100k docs), 'lmsys_sampled' for PrefEval (10k docs)")
     parser.add_argument("--vllm_server_url", type=str, default="8008", help="vLLM server URL or port number (e.g., 8006 or http://localhost:8008/v1)")
     parser.add_argument("--llm_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM model name")
     parser.add_argument("--use_local_llm", action="store_true", help="Use local LLM inference instead of vLLM server (for Qwen etc.)")
@@ -201,6 +201,8 @@ def main():
         indices = list(range(90)) if args.persona_index == "all" else [int(args.persona_index)]
     elif args.dataset == "PrefELI5":
         indices = list(range(73)) if args.persona_index == "all" else [int(args.persona_index)]
+    elif args.dataset == "PrefEval":
+        indices = list(range(57)) if args.persona_index == "all" else [int(args.persona_index)]
 
     # EPICMain instance creation
     epic = EPICMain(

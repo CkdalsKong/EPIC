@@ -19,13 +19,29 @@ class EPICGeneration:
         self.embedding_file = utils.embedding_file
         self.batch_size = getattr(utils, 'batch_size', 16)  # Default batch size if not set
 
-    def process_query(self, query, preference_text, preferences, filtered_chunks, index, method_dir, generation_prompt, filtered_instructions=None, pref_indices=None, pref_chunks_map=None, pref_instructions_map=None):
+    def process_query(self, query, preference_text, preferences, index, method_dir, generation_prompt, chunk_metadata=None):
+        """
+        Process a single query using unified FAISS index with metadata filtering
+        
+        Args:
+            query: Query dict with "question" field
+            preference_text: Current preference text
+            preferences: List of all preferences
+            index: Unified FAISS index
+            method_dir: Method output directory
+            generation_prompt: Prompt template for generation
+            chunk_metadata: List of chunk metadata dicts with preference_ids
+        """
         question = query["question"]
-
-        # For EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined: use preference-specific FAISS
-        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"] and pref_indices is not None:
+        
+        start_retrieval = time.time()
+        
+        # Get query embedding
+        query_emb = self.utils.embed_query_mp(question)
+        
+        # For insight/inst methods: find top-1 preference and filter by preference_ids
+        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"] and chunk_metadata is not None:
             # Find top-1 preference for this query
-            query_emb = self.utils.embed_query_mp(question)
             preference_embs = []
             for pref in preferences:
                 pref_emb = self.utils.embed_query_mp(pref)
@@ -34,55 +50,51 @@ class EPICGeneration:
             preference_embs = np.vstack(preference_embs)
             sims = np.dot(preference_embs, query_emb.T).squeeze()
             top_pref_idx = np.argmax(sims)
+            top_pref_text = preferences[top_pref_idx]
             
-            # Use the preference-specific index
-            pref_index = pref_indices[top_pref_idx]
-            pref_chunks = pref_chunks_map[top_pref_idx]
-            pref_instructions = pref_instructions_map[top_pref_idx]
-            
-            # Retrieve from preference-specific FAISS
-            start_retrieval = time.time()
-            query_emb = self.utils.embed_query_mp(question)
-            query_emb = query_emb + self.utils.embed_query_mp(preferences[top_pref_idx])
+            # Augment query with preference
+            query_emb = query_emb + self.utils.embed_query_mp(top_pref_text)
             query_emb = query_emb / np.linalg.norm(query_emb, axis=1, keepdims=True)
             
+            # Search with larger k to allow for filtering
             top_k = self.utils.top_k
-            D, I = pref_index.search(query_emb, top_k)
+            search_k = min(top_k * 5, index.ntotal)  # Fetch more to filter
+            D, I = index.search(query_emb.astype(np.float32), search_k)
+            
+            # Filter by preference_ids and collect results
+            retrieved = []
+            retrieved_instructions = []
+            for idx in I[0]:
+                if idx < 0 or idx >= len(chunk_metadata):
+                    continue
+                meta = chunk_metadata[idx]
+                # Check if this chunk is relevant to top preference
+                if top_pref_text in meta.get("preference_ids", []):
+                    retrieved.append(meta["text"])
+                    retrieved_instructions.append(meta.get("instruction", meta.get("insight", "")))
+                    if len(retrieved) >= top_k:
+                        break
+            
             retrieval_time = time.time() - start_retrieval
             
-            retrieved = [pref_chunks[i] for i in I[0]]
-            retrieved_instructions = [pref_instructions[i] for i in I[0]]
-            
-            # Augment with instructions
+            # Build context with instructions/insights
             context_parts = []
             for i, (doc, inst) in enumerate(zip(retrieved, retrieved_instructions)):
-                context_parts.append(f"Document {i+1}:\nInterpretation Guidance: {inst}\nContent: {doc}")
+                if inst:
+                    context_parts.append(f"Document {i+1}:\nInterpretation Guidance: {inst}\nContent: {doc}")
+                else:
+                    context_parts.append(f"Document {i+1}: {doc}")
             context = "\n\n".join(context_parts)
         else:
-            # Original method
+            # Original cosine method: no preference filtering
+            filtered_chunks = [m["text"] for m in chunk_metadata] if chunk_metadata else []
             retrieved, retrieval_time = self.utils.retrieve_top_k_wq_cosine(
                 question,
                 preferences,
                 index,
                 filtered_chunks
             )
-            
-            # For EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined with single index (legacy)
-            if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"] and filtered_instructions is not None:
-                # Find corresponding instructions for retrieved chunks
-                context_parts = []
-                for i, doc in enumerate(retrieved):
-                    try:
-                        doc_idx = filtered_chunks.index(doc)
-                        instruction = filtered_instructions[doc_idx]
-                        context_parts.append(f"Document {i+1}:\nInterpretation Guidance: {instruction}\nContent: {doc}")
-                    except (ValueError, IndexError):
-                        # Fallback if instruction not found
-                        context_parts.append(f"Document {i+1}: {doc}")
-                context = "\n\n".join(context_parts)
-            else:
-                # Original method: just concatenate documents
-                context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved)])
+            context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved)])
         
         filled_prompt = generation_prompt.replace("{context}", context).replace("{question}", question)
         
@@ -123,6 +135,8 @@ class EPICGeneration:
             data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
         elif self.utils.dataset_name == "PrefRQ":
             data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+        elif self.utils.dataset_name == "PrefEval":
+            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
             
         # Determine index file path based on index type
         model_name_clean = self.emb_model_name.replace("/", "_")
@@ -133,93 +147,41 @@ class EPICGeneration:
         
         preference_list = [block["preference"] for block in persona["preference_blocks"]]
 
-        # For EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined: load preference-specific FAISS indices
-        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
-            # Load preference mapping
-            pref_mapping_file = os.path.join(method_dir, "preference_mapping.json")
-            if os.path.exists(pref_mapping_file):
-                print("Loading preference-specific FAISS indices...")
-                with open(pref_mapping_file, 'r', encoding='utf-8') as f:
-                    pref_mapping = json.load(f)
-                
-                pref_to_idx = pref_mapping["preference_to_idx"]
-                
-                # Load each preference's FAISS index and chunks
-                pref_indices = {}
-                pref_chunks_map = {}
-                pref_instructions_map = {}
-                
-                for pref_text, pref_idx in pref_to_idx.items():
-                    pref_index_file = os.path.join(data_dir, f"index_pref{pref_idx}_{model_name_clean}.faiss")
-                    pref_kept_file = os.path.join(method_dir, f"kept_pref{pref_idx}.jsonl")
-                    
-                    if os.path.exists(pref_index_file) and os.path.exists(pref_kept_file):
-                        pref_index = faiss.read_index(pref_index_file)
-                        pref_indices[pref_idx] = pref_index
-                        
-                        # Load chunks and instructions for this preference
-                        pref_chunks = []
-                        pref_instructions = []
-                        with open(pref_kept_file, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                item = json.loads(line)
-                                pref_chunks.append(item["text"])
-                                pref_instructions.append(item.get("instruction", ""))
-                        
-                        pref_chunks_map[pref_idx] = pref_chunks
-                        pref_instructions_map[pref_idx] = pref_instructions
-                        print(f"  Loaded preference {pref_idx}: {len(pref_chunks)} chunks")
-                    else:
-                        print(f"  Warning: Missing files for preference {pref_idx}")
-                
-                print(f"✅ Loaded {len(pref_indices)} preference-specific FAISS indices")
-                
-                # Set variables for preference-based retrieval
-                index = None
-                filtered_chunks = None
-                filtered_instructions = None
-            else:
-                print("⚠️ Preference mapping not found, falling back to single index")
-                # Fallback to single index
-                index_file = os.path.join(data_dir, f"index_{model_name_clean}.faiss")
-                index = faiss.read_index(index_file)
-                
-                filtered_chunks_file = os.path.join(method_dir, "kept.jsonl")
-                filtered_chunks = []
-                filtered_instructions = []
-                with open(filtered_chunks_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        item = json.loads(line)
-                        filtered_chunks.append(item["text"])
-                        filtered_instructions.append(item.get("instruction", ""))
-                
-                pref_indices = None
-                pref_chunks_map = None
-                pref_instructions_map = None
-        else:
-            # Original method: single FAISS index
+        # Load unified FAISS index and metadata (same approach for all methods)
+        index_file = os.path.join(method_dir, f"index_{model_name_clean}.faiss")
+        if not os.path.exists(index_file):
+            # Fallback to data_dir if not in method_dir
             index_file = os.path.join(data_dir, f"index_{model_name_clean}.faiss")
-            index = faiss.read_index(index_file)
-
-            filtered_chunks_file = os.path.join(method_dir, "kept.jsonl")
-            filtered_chunks = []
-            filtered_instructions = []
-            
-            with open(filtered_chunks_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    item = json.loads(line)
-                    filtered_chunks.append(item["text"])
-                    # For EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined, also load instructions/insights
-                    if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
-                        filtered_instructions.append(item.get("instruction", ""))
-            
-            print(f"Loaded {len(filtered_chunks)} filtered chunks")
-            if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
-                print(f"Loaded {len(filtered_instructions)} instructions/insights")
-            
-            pref_indices = None
-            pref_chunks_map = None
-            pref_instructions_map = None
+        
+        print(f"Loading FAISS index from: {index_file}")
+        index = faiss.read_index(index_file)
+        print(f"✅ Loaded FAISS index with {index.ntotal} vectors")
+        
+        # Load chunk metadata with preference_ids
+        kept_file = os.path.join(method_dir, "kept.jsonl")
+        chunk_metadata = []
+        
+        with open(kept_file, "r", encoding="utf-8") as f:
+            for line in f:
+                item = json.loads(line)
+                chunk_metadata.append({
+                    "text": item["text"],
+                    # Handle different field names from different methods
+                    "preference_ids": item.get("relevant_preferences", item.get("preference_ids", item.get("relevant_preference", []))),
+                    "instruction": item.get("instruction", ""),
+                    "insight": item.get("insight", ""),
+                    "reason": item.get("reason", "")
+                })
+        
+        print(f"✅ Loaded {len(chunk_metadata)} chunks with metadata")
+        
+        # Count chunks per preference for insight/inst methods
+        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
+            pref_counts = {}
+            for meta in chunk_metadata:
+                for pref in meta.get("preference_ids", []):
+                    pref_counts[pref[:50] + "..."] = pref_counts.get(pref[:50] + "...", 0) + 1
+            print(f"Chunks per preference: {pref_counts}")
         
         generation_prompt = self.utils.load_prompt_template(self.utils.generation_prompt)
 
@@ -239,33 +201,17 @@ class EPICGeneration:
             with ThreadPoolExecutor(max_workers=1) as executor:  # Set workers to number of GPUs
                 futures = []
                 for query in queries:
-                    # Pass instructions/insights for EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined
-                    if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
-                        future = executor.submit(
-                            self.process_query,
-                            query,
-                            preference_text,    # existing cheating method
-                            preferences,        # pass all, then infer relevant preference using LLM
-                            filtered_chunks,
-                            index,  # pass index
-                            method_dir,
-                            generation_prompt,
-                            filtered_instructions,
-                            pref_indices,
-                            pref_chunks_map,
-                            pref_instructions_map
-                        )
-                    else:
-                        future = executor.submit(
-                            self.process_query,
-                            query,
-                            preference_text,    # existing cheating method
-                            preferences,        # pass all, then infer relevant preference using LLM
-                            filtered_chunks,
-                            index,  # pass index
-                            method_dir,
-                            generation_prompt
-                        )
+                    # Use unified FAISS with metadata for all methods
+                    future = executor.submit(
+                        self.process_query,
+                        query,
+                        preference_text,
+                        preferences,
+                        index,
+                        method_dir,
+                        generation_prompt,
+                        chunk_metadata
+                    )
                     futures.append(future)
                 
                 # Collect results

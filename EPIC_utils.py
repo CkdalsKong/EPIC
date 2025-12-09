@@ -81,6 +81,9 @@ class EPICUtils:
         elif dataset == "PrefELI5":
             self.dataset = "dataset/PrefELI5.json"
             self.dataset_name = "PrefELI5"
+        elif dataset == "PrefEval":
+            self.dataset = "dataset/PrefEval.json"
+            self.dataset_name = "PrefEval"
 
         print(f"Persona task file: {self.dataset}")
         print(f"LLM model name: {self.llm_model_name}")
@@ -108,6 +111,14 @@ class EPICUtils:
             else:
                 self.data_dir = os.path.join(self.root_dir, f"indexing/{self.doc_mode}/{self.method}_rq")
 
+        elif self.dataset_name == "PrefEval":
+            if self.llm_model_name == "openai/gpt-oss-20b":
+                self.data_dir = os.path.join(self.root_dir, f"indexing/{self.doc_mode}/{self.method}_prefeval_oss")
+            elif self.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+                self.data_dir = os.path.join(self.root_dir, f"indexing/{self.doc_mode}/{self.method}_prefeval_qwen")
+            else:
+                self.data_dir = os.path.join(self.root_dir, f"indexing/{self.doc_mode}/{self.method}_prefeval")
+
         self.vllm_server_url = vllm_server_url
         self.use_local_llm = use_local_llm
         
@@ -129,6 +140,8 @@ class EPICUtils:
             self.output_dir = f"{self.output_dir}_prefeli5"
         elif self.dataset_name == "PrefRQ":
             self.output_dir = f"{self.output_dir}_rq"
+        elif self.dataset_name == "PrefEval":
+            self.output_dir = f"{self.output_dir}_prefeval"
         else:
             self.output_dir = f"{self.output_dir}"
         
@@ -140,6 +153,10 @@ class EPICUtils:
             self.output_dir = f"{self.output_dir}/wiki_total"
         elif doc_mode == "eli5_total":
             self.output_dir = f"{self.output_dir}/eli5_total"
+        elif doc_mode == "lmsys":
+            self.output_dir = f"{self.output_dir}/lmsys"
+        elif doc_mode == "lmsys_sampled":
+            self.output_dir = f"{self.output_dir}/lmsys_sampled"
         else:
             self.output_dir = f"{self.output_dir}/sample"
 
@@ -155,6 +172,12 @@ class EPICUtils:
         elif doc_mode == "eli5_total":
             self.chunk_file = os.path.join(self.root_dir_corpus, "full_eli5_chunks_with_doc_sw.jsonl")
             self.embedding_file = os.path.join(self.root_dir_corpus, f"full_sw_eli5_embeddings_with_doc_{model_name_clean}.npy")
+        elif doc_mode == "lmsys":
+            self.chunk_file = os.path.join(self.root_dir_corpus, "final/sampled_lmsys_doc.jsonl")
+            self.embedding_file = os.path.join(self.root_dir_corpus, f"final/sampled_lmsys_doc_embedding_{model_name_clean}.npy")
+        elif doc_mode == "lmsys_sampled":
+            self.chunk_file = os.path.join(self.root_dir_corpus, "final/sampled_lmsys_doc_10000.jsonl")
+            self.embedding_file = os.path.join(self.root_dir_corpus, f"final/sampled_lmsys_doc_10000_embedding_{model_name_clean}.npy")
         
         self.emb_tokenizer = None
         self.emb_model = None

@@ -64,6 +64,8 @@ class EPICIndexing:
             preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_prefeli5_mp.npy")
         elif self.utils.dataset_name == "PrefRQ":
             preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_rq_mp.npy")
+        elif self.utils.dataset_name == "PrefEval":
+            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_prefeval_mp.npy")
 
 
         if os.path.exists(preference_emb_file):
@@ -483,18 +485,15 @@ class EPICIndexing:
         start_faiss = time.time()
         
         # For EPIC_inst and EPIC_inst_combined: create separate FAISS per preference
-        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
+        if self.method in ["EPIC_inst", "EPIC_inst_combined"]:
             print("Creating preference-specific FAISS indices...")
             
-            # Group chunks and instructions/insights by preference
-            preference_groups = {}  # {pref_text: [(chunk, instruction/insight), ...]}
-            
-            # Determine key name based on method
-            text_key = "insight" if self.method in ["EPIC_insight", "EPIC_insight_combined"] else "instruction"
+            # Group chunks and instructions by preference
+            preference_groups = {}  # {pref_text: [(chunk, instruction), ...]}
             
             for item in inst_final:
                 chunk = item["chunk"]
-                instruction = item.get(text_key, item.get("instruction", item.get("insight", "")))
+                instruction = item.get("instruction", "")
                 relevant_prefs = item.get("relevant_preference", [])
                 
                 # Handle case where relevant_preference might be a string or list
@@ -559,6 +558,72 @@ class EPICIndexing:
             pref_mapping_file = os.path.join(method_dir, "preference_mapping.json")
             self.utils.save_json(pref_mapping_file, pref_mapping)
             print(f"✅ Saved preference mapping to {pref_mapping_file}")
+        
+        # For EPIC_insight and EPIC_insight_combined: single FAISS with metadata
+        elif self.method in ["EPIC_insight", "EPIC_insight_combined"]:
+            print("Creating single FAISS index with metadata (insight method)...")
+            
+            # Prepare metadata for each chunk
+            chunk_metadata = []
+            for idx, item in enumerate(inst_final):
+                chunk = item["chunk"]
+                insight = item.get("insight", "")
+                relevant_prefs = item.get("relevant_preference", [])
+                
+                # Handle case where relevant_preference might be a string or list
+                if isinstance(relevant_prefs, str):
+                    relevant_prefs = [relevant_prefs]
+                
+                chunk_metadata.append({
+                    "id": idx,
+                    "text": chunk,
+                    "insight": insight,
+                    "relevant_preferences": relevant_prefs,
+                    "active": True
+                })
+            
+            # Generate embeddings for insights (use insight embeddings for retrieval)
+            insights_list = [item["insight"] for item in chunk_metadata]
+            print(f"Generating embeddings for {len(insights_list)} insights...")
+            embeddings = self.utils.embed_texts_mp(insights_list)
+            embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+            
+            # Create single FAISS index
+            dim = embeddings.shape[1]
+            print(f"Creating FAISS IndexFlatIP (dim={dim})...")
+            index = faiss.IndexFlatIP(dim)
+            index.add(embeddings.astype(np.float32))
+            
+            # Save FAISS index and embeddings
+            faiss.write_index(index, index_file)
+            print(f"✅ FAISS index saved to {index_file}")
+            np.save(embeddings_file, embeddings)
+            print(f"✅ Embeddings saved to {embeddings_file}")
+            
+            # Save chunks with metadata (including insights and preferences)
+            kept_file = os.path.join(method_dir, "kept.jsonl")
+            self.utils.save_jsonl(kept_file, chunk_metadata)
+            print(f"✅ Kept chunks with metadata saved to {kept_file}")
+            
+            # Save preference mapping for reference
+            pref_to_idx = {pref: idx for idx, pref in enumerate(preference_list)}
+            pref_mapping = {
+                "preference_to_idx": pref_to_idx,
+                "preference_list": preference_list,
+                "total_chunks": len(chunk_metadata),
+                "method": self.method
+            }
+            pref_mapping_file = os.path.join(method_dir, "preference_mapping.json")
+            self.utils.save_json(pref_mapping_file, pref_mapping)
+            print(f"✅ Saved preference mapping to {pref_mapping_file}")
+            
+            # Print summary
+            print(f"\n📊 Insight Indexing Summary:")
+            print(f"   Total chunks indexed: {len(chunk_metadata)}")
+            unique_prefs = set()
+            for item in chunk_metadata:
+                unique_prefs.update(item["relevant_preferences"])
+            print(f"   Unique preferences found: {len(unique_prefs)}")
             
         else:
             # Original method: single FAISS for all chunks
@@ -608,6 +673,25 @@ class EPICIndexing:
                 "total_time(s)": f"{total_time:.2f}"
             }
         elif self.method in ["EPIC_inst", "EPIC_inst_combined"]:
+            row = {
+                "method": f"{self.method}{llm_name}",
+                "persona_index": f"{persona_index}",
+                "cosine_kept": len(kept_chunks),
+                "random_kept": len(kept_chunks),
+                "cluster_kept": 0,
+                "llm_filtered": len(filtered),
+                "rewritten": 0,
+                "kept": len(kept),
+                "cosine_filter_time(s)": f"{filter_time:.2f}",
+                "random_filter_time(s)": f"{filter_time:.2f}",
+                "cluster_filter_time(s)": "0",
+                "llm_time(s)": f"{llm_time:.2f}",
+                "rewriting_time(s)": "0",
+                "inst_time(s)": f"{inst_time:.2f}",
+                "faiss_time(s)": f"{faiss_time:.2f}",
+                "total_time(s)": f"{total_time:.2f}"
+            }
+        elif self.method in ["EPIC_insight", "EPIC_insight_combined"]:
             row = {
                 "method": f"{self.method}{llm_name}",
                 "persona_index": f"{persona_index}",
