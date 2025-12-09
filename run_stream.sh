@@ -1,0 +1,1 @@
+EPIC_main.py --method EPIC_insight --persona_index 0 --mode stream     --output_dir output --dataset PrefWiki --doc_mode wiki     --llm_model_name Qwen/Qwen2.5-3B-Instruct --use_local_llm     --stream_batch_size 2000
