@@ -1,0 +1,25 @@
+<user_preferences>
+{preference}
+</user_preferences>
+
+<given_chunk>
+{chunk}
+</given_chunk>
+
+<reason>
+{reason}
+</reason>
+
+<task>
+Extract a key insight from the given chunk that captures what's valuable for someone with the stated preferences.
+
+- Write a concise insight using only the <insight> XML tag.
+- The insight should distill the most important knowledge from this chunk.
+- Do not summarize the chunk; instead, extract what it reveals or implies.
+- Do not include any explanation or other tags.
+</task>
+
+<answer>
+
+</output>
+

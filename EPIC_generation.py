@@ -22,8 +22,8 @@ class EPICGeneration:
     def process_query(self, query, preference_text, preferences, filtered_chunks, index, method_dir, generation_prompt, filtered_instructions=None, pref_indices=None, pref_chunks_map=None, pref_instructions_map=None):
         question = query["question"]
 
-        # For EPIC_inst and EPIC_inst_combined: use preference-specific FAISS
-        if self.method in ["EPIC_inst", "EPIC_inst_combined"] and pref_indices is not None:
+        # For EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined: use preference-specific FAISS
+        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"] and pref_indices is not None:
             # Find top-1 preference for this query
             query_emb = self.utils.embed_query_mp(question)
             preference_embs = []
@@ -67,8 +67,8 @@ class EPICGeneration:
                 filtered_chunks
             )
             
-            # For EPIC_inst and EPIC_inst_combined with single index (legacy)
-            if self.method in ["EPIC_inst", "EPIC_inst_combined"] and filtered_instructions is not None:
+            # For EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined with single index (legacy)
+            if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"] and filtered_instructions is not None:
                 # Find corresponding instructions for retrieved chunks
                 context_parts = []
                 for i, doc in enumerate(retrieved):
@@ -133,8 +133,8 @@ class EPICGeneration:
         
         preference_list = [block["preference"] for block in persona["preference_blocks"]]
 
-        # For EPIC_inst and EPIC_inst_combined: load preference-specific FAISS indices
-        if self.method in ["EPIC_inst", "EPIC_inst_combined"]:
+        # For EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined: load preference-specific FAISS indices
+        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
             # Load preference mapping
             pref_mapping_file = os.path.join(method_dir, "preference_mapping.json")
             if os.path.exists(pref_mapping_file):
@@ -209,13 +209,13 @@ class EPICGeneration:
                 for line in f:
                     item = json.loads(line)
                     filtered_chunks.append(item["text"])
-                    # For EPIC_inst and EPIC_inst_combined, also load instructions
-                    if self.method in ["EPIC_inst", "EPIC_inst_combined"]:
+                    # For EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined, also load instructions/insights
+                    if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
                         filtered_instructions.append(item.get("instruction", ""))
             
             print(f"Loaded {len(filtered_chunks)} filtered chunks")
-            if self.method in ["EPIC_inst", "EPIC_inst_combined"]:
-                print(f"Loaded {len(filtered_instructions)} instructions")
+            if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
+                print(f"Loaded {len(filtered_instructions)} instructions/insights")
             
             pref_indices = None
             pref_chunks_map = None
@@ -239,8 +239,8 @@ class EPICGeneration:
             with ThreadPoolExecutor(max_workers=1) as executor:  # Set workers to number of GPUs
                 futures = []
                 for query in queries:
-                    # Pass instructions for EPIC_inst and EPIC_inst_combined
-                    if self.method in ["EPIC_inst", "EPIC_inst_combined"]:
+                    # Pass instructions/insights for EPIC_inst, EPIC_inst_combined, EPIC_insight, EPIC_insight_combined
+                    if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
                         future = executor.submit(
                             self.process_query,
                             query,

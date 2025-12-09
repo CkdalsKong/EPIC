@@ -8,10 +8,11 @@ from EPIC_utils import EPICUtils
 from EPIC_indexing import EPICIndexing
 from EPIC_generation import EPICGeneration
 from EPIC_evaluation import EPICEvaluation
+from EPIC_stream import StreamSetup, StreamManager
 import multiprocessing
 
 class EPICMain:
-    def __init__(self, mode="all", method="all", device="cuda:0", output_dir="output", dataset="PrefWiki", emb_model_name="facebook/contriever", doc_mode="wiki", vllm_server_url="http://localhost:8008/v1", llm_model_name="meta-llama/Llama-3.1-8B-Instruct"):
+    def __init__(self, mode="all", method="all", device="cuda:0", output_dir="output", dataset="PrefWiki", emb_model_name="facebook/contriever", doc_mode="wiki", vllm_server_url="http://localhost:8008/v1", llm_model_name="meta-llama/Llama-3.1-8B-Instruct", use_local_llm=False, stream_batch_size=2000, stream_num_add=2, stream_num_remove=1):
         self.mode = mode
         self.method = method
         self.device = device
@@ -21,6 +22,13 @@ class EPICMain:
         self.doc_mode = doc_mode
         self.vllm_server_url = vllm_server_url
         self.llm_model_name = llm_model_name
+        self.use_local_llm = use_local_llm
+        
+        # Stream mode options
+        self.stream_batch_size = stream_batch_size
+        self.stream_num_add = stream_num_add
+        self.stream_num_remove = stream_num_remove
+        
         self.utils = EPICUtils(
             mode=mode,
             method=method,
@@ -31,11 +39,13 @@ class EPICMain:
             doc_mode=doc_mode,
             vllm_server_url=vllm_server_url,
             llm_model_name=llm_model_name,
+            use_local_llm=use_local_llm,
         )
         
         self.indexing = EPICIndexing(self.utils)
         self.generation = EPICGeneration(self.utils)
         self.evaluation = EPICEvaluation(self.utils)
+        self.stream_manager = StreamManager(self.utils)
         self._models_loaded = False
         self._chunks_cache = None
         self._embeddings_cache = None
@@ -129,20 +139,52 @@ class EPICMain:
                 self.evaluation.run_evaluation_with_cache(persona_index, method_dir, cached_resources)
                 print(f"✅ Evaluation completed. Results saved to {eval_file}")
         
+        # 4. Stream mode
+        if self.mode == "stream":
+            print("\n4. Starting stream processing...")
+            print(f"   Batch size: {self.stream_batch_size}")
+            print(f"   Preference add events: {self.stream_num_add}")
+            print(f"   Preference remove events: {self.stream_num_remove}")
+            
+            # Create preference events
+            total_docs = len(cached_resources["chunks"])
+            preference_events = self.stream_manager.create_random_preference_events(
+                num_add=self.stream_num_add, 
+                num_remove=self.stream_num_remove,
+                total_docs=total_docs,
+                batch_size=self.stream_batch_size
+            )
+            
+            # Run stream experiment
+            stream = self.stream_manager.run_stream_experiment(
+                persona_index=persona_index,
+                all_chunks=cached_resources["chunks"],
+                all_embeddings=cached_resources["embeddings"],
+                method_dir=method_dir,
+                batch_size=self.stream_batch_size,
+                preference_events=preference_events
+            )
+            print(f"✅ Stream processing completed. Results saved to stream directory.")
+        
         print(f"\n=== Completed persona {persona_index} ===")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, required=True, choices=["EPIC", "cosine", "EPIC_inst", "EPIC_inst_combined"])
+    parser.add_argument("--method", type=str, required=True, choices=["EPIC", "cosine", "EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"])
     parser.add_argument("--persona_index", type=str, required=True, help="Persona index (0-10) or 'all'")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use (e.g., cuda:0)")
-    parser.add_argument("--mode", type=str, required=True, choices=["indexing", "generation", "evaluation", "all"], help="Mode to run: 'indexing', 'generation', 'evaluation', or 'all'")
+    parser.add_argument("--mode", type=str, required=True, choices=["indexing", "generation", "evaluation", "all", "stream"], help="Mode to run: 'indexing', 'generation', 'evaluation', 'all', or 'stream'")
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output folder")
     parser.add_argument("--dataset", type=str, required=True, help="Path to the dataset file")
     parser.add_argument("--emb_model_name", type=str, default="facebook/contriever")
     parser.add_argument("--doc_mode", type=str, required=True, choices=["wiki", "eli5", "wiki_total", "eli5_total"], help="Document mode: 'wiki' for PrefWiki, PrefRQ, 'eli5' for PrefELI5")
     parser.add_argument("--vllm_server_url", type=str, default="8008", help="vLLM server URL or port number (e.g., 8006 or http://localhost:8008/v1)")
     parser.add_argument("--llm_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM model name")
+    parser.add_argument("--use_local_llm", action="store_true", help="Use local LLM inference instead of vLLM server (for Qwen etc.)")
+    # Stream mode options
+    parser.add_argument("--stream_batch_size", type=int, default=2000, help="Batch size for stream mode (documents per batch)")
+    parser.add_argument("--stream_num_add", type=int, default=2, help="Number of preference add events in stream mode")
+    parser.add_argument("--stream_num_remove", type=int, default=1, help="Number of preference remove events in stream mode")
     args = parser.parse_args()
 
     # vLLM URL Processing
@@ -171,6 +213,10 @@ def main():
         doc_mode=args.doc_mode,
         vllm_server_url=vllm_server_url,
         llm_model_name=args.llm_model_name,
+        use_local_llm=args.use_local_llm,
+        stream_batch_size=args.stream_batch_size,
+        stream_num_add=args.stream_num_add,
+        stream_num_remove=args.stream_num_remove,
     )
 
     if indices:

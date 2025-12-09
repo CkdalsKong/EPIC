@@ -95,7 +95,7 @@ class EPICIndexing:
         cosine_flag = 0
 
         # For EPIC method: load cosine filtering results from cosine method's output
-        if self.method in ["EPIC", "EPIC_inst", "EPIC_inst_combined"]:
+        if self.method in ["EPIC", "EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
             # Find cosine method's output directory path
             if self.utils.llm_model_name == "openai/gpt-oss-20b":
                 cosine_method_dir = os.path.join(self.output_dir, f"cosine_oss/{persona_index}")
@@ -197,6 +197,18 @@ class EPICIndexing:
             filtering_prompt_system = self.utils.load_prompt_template(self.utils.filtering_inst_combined_system)
             filtering_prompt_user = self.utils.load_prompt_template(self.utils.filtering_inst_combined_user)
 
+        elif self.method == "EPIC_insight":
+            insight_file = os.path.join(method_dir, "insights.jsonl")
+
+            filtering_prompt_system = self.utils.load_prompt_template(self.utils.filtering_inst_system)
+            filtering_prompt_user = self.utils.load_prompt_template(self.utils.filtering_inst_user)
+
+        elif self.method == "EPIC_insight_combined":
+            insight_file = os.path.join(method_dir, "insights.jsonl")
+
+            filtering_prompt_system = self.utils.load_prompt_template(self.utils.filtering_insight_system)
+            filtering_prompt_user = self.utils.load_prompt_template(self.utils.filtering_insight_user)
+
         preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(preference_list)])
 
         start_llm = time.time()
@@ -224,6 +236,10 @@ class EPICIndexing:
                     futures = {executor.submit(self.utils.process_chunk_inst, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
                 elif self.method == "EPIC_inst_combined":
                     futures = {executor.submit(self.utils.process_chunk_inst_combined, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
+                elif self.method == "EPIC_insight":
+                    futures = {executor.submit(self.utils.process_chunk_insight, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
+                elif self.method == "EPIC_insight_combined":
+                    futures = {executor.submit(self.utils.process_chunk_insight_combined, idx, kept_chunks[idx], preference_text, filtering_prompt_user, filtering_prompt_system, relevant_preferences[idx], kept_save[idx]): idx for idx in range(len(kept_chunks))}
                 for future in tqdm(as_completed(futures), total=len(futures), desc=f"LLM: persona {persona_index}", leave=False, ncols=100):
                     result = future.result()
                     if result:
@@ -255,12 +271,17 @@ class EPICIndexing:
                         "relevant_preference": item["relevant_preference"]
                     })
                 elif item["decision"] == "Keep":
-                    kept.append({
+                    kept_item = {
                         "chunk": item["chunk"],
                         "reason": item["reason"],
-                        "instruction": item.get("instruction", ""),
                         "relevant_preference": item["relevant_preference"]
-                    })
+                    }
+                    # Add instruction or insight based on method
+                    if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
+                        kept_item["instruction"] = item.get("instruction", "")
+                    elif self.method in ["EPIC_insight", "EPIC_insight_combined"]:
+                        kept_item["insight"] = item.get("insight", "")
+                    kept.append(kept_item)
 
         print(f"LLM filtering completed. Success: {success_count}, Failed: {failed_count}")
 
@@ -388,20 +409,92 @@ class EPICIndexing:
             # For EPIC_inst_combined: embed instructions and save to FAISS
             instruction_texts = [item["instruction"] for item in inst_final]
             merged_chunks = [item["chunk"] for item in inst_final]
+
+        elif self.method == "EPIC_insight":
+            insight_prompt_system = self.utils.load_prompt_template(self.utils.insight_system)
+            insight_prompt_user = self.utils.load_prompt_template(self.utils.insight_user)
+            
+            start_inst = time.time()
+            insight_final = []
+
+            if os.path.exists(insight_file):
+                print(f"⚠️ Found existing insight file. Skipping insight generation: {insight_file}")
+                with open(insight_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        insight_final.append(json.loads(line))
+                inst_time = 0.0
+            else:
+                if kept:
+                    first_entry = kept[0]
+                    first_chunk = first_entry["chunk"]
+                    preferences = first_entry.get("relevant_preference", [])
+                    preference_text_insight = "\n".join([f"- {p}" for p in preferences]) if isinstance(preferences, list) else preferences
+
+                    filled_user_prompt = insight_prompt_user.format(preference=preference_text_insight, chunk=first_chunk, reason=first_entry["reason"])
+                    full_prompt = {
+                        "system_prompt": insight_prompt_system,
+                        "user_prompt": filled_user_prompt,
+                        "full_conversation": f"System: {insight_prompt_system}\n\nUser: {filled_user_prompt}"
+                    }
+                    prompt_file = os.path.join(method_dir, "insight_prompt_sample.json")
+                    self.utils.save_json(prompt_file, full_prompt)
+                    print(f"✅ Insight prompt sample saved to {prompt_file}")
+                
+                with ThreadPoolExecutor() as executor:  
+                    futures = [executor.submit(self.utils.insight_single, entry, insight_prompt_user, insight_prompt_system=insight_prompt_system) for entry in kept]
+                    for future in tqdm(as_completed(futures), total=len(futures), desc="Generating insights", leave=False, ncols=100):
+                        try:
+                            result = future.result()
+                            insight_final.append(result)
+                        except Exception as e:
+                            print(f"Insight generation failed: {e}")
+                inst_time = time.time() - start_inst
+                self.utils.save_jsonl(insight_file, insight_final)
+                print(f"✅ Insight info saved to {insight_file}")
+            
+            print(f"Insight generation completed. Produced {len(insight_final)} insights")
+            
+            # For EPIC_insight: embed insights and save to FAISS
+            instruction_texts = [item["insight"] for item in insight_final]
+            merged_chunks = [item["chunk"] for item in insight_final]
+            inst_final = insight_final  # For compatibility with FAISS creation
+
+        elif self.method == "EPIC_insight_combined":
+            start_inst = time.time()
+            inst_time = 0.0  # No separate insight generation step
+            
+            # Insights were already generated during filtering
+            insight_final = kept
+            print(f"Insights already generated during filtering. Total: {len(insight_final)}")
+            
+            # Save insights to file
+            if not os.path.exists(insight_file):
+                self.utils.save_jsonl(insight_file, insight_final)
+                print(f"✅ Insight info saved to {insight_file}")
+            
+            # For EPIC_insight_combined: embed insights and save to FAISS
+            instruction_texts = [item["insight"] for item in insight_final]
+            merged_chunks = [item["chunk"] for item in insight_final]
+            inst_final = insight_final  # For compatibility with FAISS creation
         
         print("\nCreating FAISS index...")
         start_faiss = time.time()
         
         # For EPIC_inst and EPIC_inst_combined: create separate FAISS per preference
-        if self.method in ["EPIC_inst", "EPIC_inst_combined"]:
+        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
             print("Creating preference-specific FAISS indices...")
             
-            # Group chunks and instructions by preference
-            preference_groups = {}  # {pref_text: [(chunk, instruction), ...]}
+            # Group chunks and instructions/insights by preference
+            preference_groups = {}  # {pref_text: [(chunk, instruction/insight), ...]}
+            
+            # Determine key name based on method
+            text_key = "insight" if self.method in ["EPIC_insight", "EPIC_insight_combined"] else "instruction"
             
             for item in inst_final:
                 chunk = item["chunk"]
-                instruction = item["instruction"]
+                instruction = item.get(text_key, item.get("instruction", item.get("insight", "")))
                 relevant_prefs = item.get("relevant_preference", [])
                 
                 # Handle case where relevant_preference might be a string or list

@@ -14,6 +14,10 @@ from tqdm.auto import tqdm
 import requests
 import random
 
+# Qwen 로컬 추론을 위한 전역 변수
+_qwen_model = None
+_qwen_tokenizer = None
+
 def set_global_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -27,7 +31,7 @@ class EPICUtils:
     _seed = 0
     set_global_seed(_seed)
     
-    def __init__(self, mode, method, device, output_dir, dataset=None, emb_model_name="facebook/contriever", doc_mode="wiki", vllm_server_url="http://localhost:8008/v1", llm_model_name="meta-llama/Llama-3.1-8B-Instruct"):
+    def __init__(self, mode, method, device, output_dir, dataset=None, emb_model_name="facebook/contriever", doc_mode="wiki", vllm_server_url="http://localhost:8008/v1", llm_model_name="meta-llama/Llama-3.1-8B-Instruct", use_local_llm=False):
 
         self.root_dir = "data"
         self.root_dir_corpus = "../data/corpus"
@@ -45,6 +49,11 @@ class EPICUtils:
         self.filtering_inst_user = os.path.join(self.prompt_dir, "filtering_inst_userprompt.txt")
         self.filtering_inst_combined_system = os.path.join(self.prompt_dir, "filtering_inst_combined_systemprompt.txt")
         self.filtering_inst_combined_user = os.path.join(self.prompt_dir, "filtering_inst_combined_userprompt.txt")
+        # Insight prompts
+        self.filtering_insight_system = os.path.join(self.prompt_dir, "filtering_insight_systemprompt.txt")
+        self.filtering_insight_user = os.path.join(self.prompt_dir, "filtering_insight_userprompt.txt")
+        self.insight_system = os.path.join(self.prompt_dir, "insight_systemprompt.txt")
+        self.insight_user = os.path.join(self.prompt_dir, "insight_userprompt.txt")
         self.generation_prompt = os.path.join(self.prompt_dir, "generation_prompt.txt")
 
         self.indexing_report_file = "indexing_report.csv"
@@ -100,7 +109,16 @@ class EPICUtils:
                 self.data_dir = os.path.join(self.root_dir, f"indexing/{self.doc_mode}/{self.method}_rq")
 
         self.vllm_server_url = vllm_server_url
-        print(f"Using vllm server for {self.llm_model_name}: {self.vllm_server_url}")
+        self.use_local_llm = use_local_llm
+        
+        # Qwen 로컬 모델 관련 변수
+        self.local_llm_model = None
+        self.local_llm_tokenizer = None
+        
+        if self.use_local_llm:
+            print(f"Using LOCAL inference for {self.llm_model_name}")
+        else:
+            print(f"Using vllm server for {self.llm_model_name}: {self.vllm_server_url}")
         
 
         model_name_clean = emb_model_name.replace("/", "_")
@@ -158,14 +176,48 @@ class EPICUtils:
             else:
                 self.batch_size = 16
                 print(f"Using single GPU with batch size {self.batch_size}")
-            return
         else:
             print(f"Loading {self.emb_model_name} model...")
             self.emb_tokenizer = AutoTokenizer.from_pretrained(self.emb_model_name)
             self.emb_model = AutoModel.from_pretrained(self.emb_model_name).eval()
-
-        self.emb_model = self.emb_model.to(self.device)
-        print(f"Embedding model loaded on {self.device}")
+            self.emb_model = self.emb_model.to(self.device)
+            print(f"Embedding model loaded on {self.device}")
+        
+        # 로컬 LLM 모델 로드 (use_local_llm이 True인 경우)
+        if self.use_local_llm:
+            self.load_local_llm()
+    
+    def load_local_llm(self):
+        """Qwen 등 로컬 LLM 모델 로드"""
+        global _qwen_model, _qwen_tokenizer
+        
+        # 이미 로드된 경우 재사용
+        if _qwen_model is not None and _qwen_tokenizer is not None:
+            print(f"Reusing already loaded local LLM: {self.llm_model_name}")
+            self.local_llm_model = _qwen_model
+            self.local_llm_tokenizer = _qwen_tokenizer
+            return
+        
+        print(f"Loading local LLM: {self.llm_model_name}...")
+        
+        self.local_llm_tokenizer = AutoTokenizer.from_pretrained(
+            self.llm_model_name,
+            trust_remote_code=True
+        )
+        
+        self.local_llm_model = AutoModelForCausalLM.from_pretrained(
+            self.llm_model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        self.local_llm_model.eval()
+        
+        # 전역 변수에 저장 (재사용을 위해)
+        _qwen_model = self.local_llm_model
+        _qwen_tokenizer = self.local_llm_tokenizer
+        
+        print(f"Local LLM loaded successfully: {self.llm_model_name}")
     
     def mean_pooling(self, token_embeddings, mask):
         token_embeddings = token_embeddings.masked_fill(~mask[..., None].bool(), 0.)
@@ -252,6 +304,10 @@ class EPICUtils:
         return query_emb
     
     def generate_message_vllm(self, messages, system_prompt, max_tokens=512, logprob=False):
+        # 로컬 LLM 사용 시 로컬 추론 메서드 호출
+        if self.use_local_llm:
+            return self.generate_message_local(messages, system_prompt, max_tokens)
+        
         headers = {"Content-Type": "application/json"}
         endpoint = f"{self.vllm_server_url}/chat/completions"
         
@@ -305,6 +361,47 @@ class EPICUtils:
                     print(f"Waiting {wait_time} seconds before retry...")
                     time.sleep(wait_time)
         raise RuntimeError("Failed to get response from vLLM server after 5 attempts")
+    
+    def generate_message_local(self, messages, system_prompt, max_tokens=512):
+        """로컬 LLM을 사용한 추론 (Qwen 등)"""
+        if self.local_llm_model is None or self.local_llm_tokenizer is None:
+            raise RuntimeError("Local LLM model not loaded. Call load_local_llm() first or set use_local_llm=True.")
+        
+        # 메시지 포맷팅
+        formatted_messages = []
+        if system_prompt:
+            formatted_messages.append({"role": "system", "content": system_prompt})
+        formatted_messages.extend(messages)
+        
+        # Qwen 모델용 chat template 적용
+        text = self.local_llm_tokenizer.apply_chat_template(
+            formatted_messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        # 토크나이즈
+        model_inputs = self.local_llm_tokenizer([text], return_tensors="pt").to(self.local_llm_model.device)
+        
+        # 생성
+        with torch.no_grad():
+            generated_ids = self.local_llm_model.generate(
+                **model_inputs,
+                max_new_tokens=max_tokens,
+                do_sample=False,  # temperature=0과 동일
+                top_p=1.0,
+                pad_token_id=self.local_llm_tokenizer.eos_token_id
+            )
+        
+        # 입력 부분 제외하고 생성된 부분만 추출
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        
+        # 디코딩
+        response = self.local_llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        return response
 
     def parse_explanation_and_answer(self, input_string):
         soup = BeautifulSoup(input_string, "html.parser")
@@ -812,6 +909,16 @@ class EPICUtils:
             # Fallback: return the full response if no instruction tag found
             return input_string.strip() if input_string else None
 
+    def parse_insight(self, input_string):
+        """Parse insight from LLM response"""
+        soup = BeautifulSoup(input_string, "html.parser")
+        insight_tag = soup.find("insight")
+        if insight_tag:
+            return insight_tag.text.strip()
+        else:
+            # Fallback: return the full response if no insight tag found
+            return input_string.strip() if input_string else None
+
     def parse_decision_reason_instruction(self, input_string):
         """Parse decision, reason, preferences, and instruction from LLM response (for EPIC_inst_combined)"""
         soup = BeautifulSoup(input_string, "html.parser")
@@ -829,6 +936,24 @@ class EPICUtils:
         preferences = [self.clean_preference_text(pref) for pref in preferences]
         
         return decision, reason, preferences, instruction
+
+    def parse_decision_reason_insight(self, input_string):
+        """Parse decision, reason, preferences, and insight from LLM response (for EPIC_insight_combined)"""
+        soup = BeautifulSoup(input_string, "html.parser")
+        decision_tag = soup.find("decision")
+        reason_tag = soup.find("reason")
+        preference_tags = soup.find_all("preference")
+        insight_tag = soup.find("insight")
+        
+        decision = decision_tag.text.strip() if decision_tag else ""
+        reason = reason_tag.text.strip() if reason_tag else ""
+        preferences = [tag.text.strip() for tag in preference_tags if tag.text.strip()]
+        insight = insight_tag.text.strip() if insight_tag else ""
+        
+        # Clean preference text
+        preferences = [self.clean_preference_text(pref) for pref in preferences]
+        
+        return decision, reason, preferences, insight
 
     def inst_single(self, entry, inst_prompt_user, inst_prompt_system=None):
         """Generate instruction for a single kept chunk"""
@@ -865,6 +990,45 @@ class EPICUtils:
         return {
             "chunk": original_chunk,
             "instruction": instruction_text,
+            "reason": reason,
+            "relevant_preference": preferences
+        }
+
+    def insight_single(self, entry, insight_prompt_user, insight_prompt_system=None):
+        """Generate insight for a single kept chunk"""
+        original_chunk = entry["chunk"]
+        reason = entry.get("reason", "")
+        preferences = entry.get("relevant_preference", [])
+        preference_text = "\n".join([f"- {p}" for p in preferences]) if isinstance(preferences, list) else preferences
+        
+        try:
+            filled_prompt = insight_prompt_user.format(preference=preference_text, chunk=original_chunk, reason=reason)
+            if insight_prompt_system is None:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt="You are a helpful assistant tasked with extracting key insights from document chunks."
+                )
+            else:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt=insight_prompt_system
+                )
+            
+            if llm_response is None:
+                print(f"Warning: LLM returned None response for insight generation - using default")
+                insight_text = f"Key insight related to: {preference_text}"
+            else:
+                insight_text = self.parse_insight(llm_response)
+                if insight_text is None:
+                    insight_text = f"Key insight related to: {preference_text}"
+                    
+        except Exception as e:
+            print(f"Failed to generate insight: {e} - using default")
+            insight_text = f"Key insight related to: {preference_text}"
+        
+        return {
+            "chunk": original_chunk,
+            "insight": insight_text,
             "reason": reason,
             "relevant_preference": preferences
         }
@@ -1000,5 +1164,135 @@ class EPICUtils:
                 "decision": "Discard",
                 "reason": f"LLM processing failed: {str(e)}",
                 "instruction": "",
+                "status": "failed"
+            }
+
+    def process_chunk_insight(self, idx, chunk_text, preference_text, prompt_template, prompt_template_system=None, preference_list=None, kept_save_info=None):
+        """Process chunk for EPIC_insight: filter first, then generate insight separately"""
+        # Shuffle preferences
+        shuffled_list = preference_list[:]
+        random.Random(idx).shuffle(shuffled_list)
+        shuffled_preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(shuffled_list)])
+        filled_prompt = self.format_prompt(prompt_template, shuffled_preference_text, chunk_text)
+        
+        try:
+            if prompt_template_system is None:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt="You are a helpful assistant for indexing document chunks."
+                )
+            else:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt=prompt_template_system
+                )
+            
+            if llm_response is None:
+                print(f"Warning: LLM returned None response - using Discard decision")
+                return {
+                    "chunk": chunk_text,
+                    "decision": "Discard",
+                    "reason": "LLM returned None response",
+                    "status": "failed"
+                }
+            
+            # Parse decision, reason, and preferences
+            decision, reason, preferences = self.parse_decision_and_reason_preferences(llm_response)
+            
+            # Map numbered preferences to actual text
+            if preference_list and preferences:
+                for i, preference in enumerate(preferences):
+                    preferences[i] = self.map_preference_numbers_to_text(preference, preference_list)
+            
+            if decision == "":
+                print(f"Warning: Empty decision from LLM response - using Discard decision")
+                return {
+                    "chunk": chunk_text,
+                    "decision": "Discard",
+                    "reason": "Empty decision from LLM response",
+                    "status": "failed"
+                }
+            
+            return {
+                "chunk": chunk_text,
+                "decision": decision,
+                "reason": reason,
+                "relevant_preference": preferences,
+                "status": "success"
+            }
+                
+        except Exception as e:
+            print(f"Failed to process chunk: {e}")
+            return {
+                "chunk": chunk_text,
+                "decision": "Discard",
+                "reason": f"LLM processing failed: {str(e)}",
+                "status": "failed"
+            }
+
+    def process_chunk_insight_combined(self, idx, chunk_text, preference_text, prompt_template, prompt_template_system=None, preference_list=None, kept_save_info=None):
+        """Process chunk for EPIC_insight_combined: filter and generate insight simultaneously"""
+        # Shuffle preferences
+        shuffled_list = preference_list[:]
+        random.Random(idx).shuffle(shuffled_list)
+        shuffled_preference_text = "\n".join([f"{i+1}. '{p}'" for i, p in enumerate(shuffled_list)])
+        filled_prompt = self.format_prompt(prompt_template, shuffled_preference_text, chunk_text)
+        
+        try:
+            if prompt_template_system is None:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt="You are a helpful assistant for indexing document chunks and extracting insights."
+                )
+            else:
+                llm_response = self.generate_message_vllm(
+                    messages=[{"role": "user", "content": filled_prompt}],
+                    system_prompt=prompt_template_system
+                )
+            
+            if llm_response is None:
+                print(f"Warning: LLM returned None response - using Discard decision")
+                return {
+                    "chunk": chunk_text,
+                    "decision": "Discard",
+                    "reason": "LLM returned None response",
+                    "insight": "",
+                    "status": "failed"
+                }
+            
+            # Parse decision, reason, preferences, and insight
+            decision, reason, preferences, insight = self.parse_decision_reason_insight(llm_response)
+            
+            # Map numbered preferences to actual text
+            if preference_list and preferences:
+                for i, preference in enumerate(preferences):
+                    preferences[i] = self.map_preference_numbers_to_text(preference, preference_list)
+            
+            if decision == "":
+                print(f"Warning: Empty decision from LLM response - using Discard decision")
+                return {
+                    "chunk": chunk_text,
+                    "decision": "Discard",
+                    "reason": "Empty decision from LLM response",
+                    "insight": "",
+                    "status": "failed"
+                }
+            
+            return {
+                "chunk": chunk_text,
+                "decision": decision,
+                "reason": reason,
+                "relevant_preference": preferences,
+                "insight": insight,
+                "status": "success"
+            }
+                
+        except Exception as e:
+            print(f"Failed to process chunk: {e}")
+            return {
+                "chunk": chunk_text,
+                "decision": "Discard",
+                "reason": f"LLM processing failed: {str(e)}",
+                "insight": "",
                 "status": "failed"
             }
