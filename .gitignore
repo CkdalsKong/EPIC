@@ -5,3 +5,4 @@ __pycache__/
 .vscode/
 .idea/
 sampled*
+lmsys_chat1m_*
