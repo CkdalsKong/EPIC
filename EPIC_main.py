@@ -144,11 +144,13 @@ class EPICMain:
             print("\n4. Starting stream processing...")
             print(f"   Batch size: {self.stream_batch_size}")
             
-            # Create fixed preference events:
-            # - 2nd checkpoint: remove one preference
-            # - 4th checkpoint: add one preference
+            # Create random preference events avoiding checkpoint timings
+            total_docs = len(cached_resources["chunks"])
             preference_events = self.stream_manager.create_fixed_preference_events(
-                batch_size=self.stream_batch_size
+                batch_size=self.stream_batch_size,
+                total_docs=total_docs,
+                num_add=self.stream_num_add,
+                num_remove=self.stream_num_remove
             )
             
             print(f"   Preference events:")

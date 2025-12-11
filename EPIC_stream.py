@@ -548,6 +548,8 @@ class StreamSetup:
                     if meta.get("instruction"):
                         item["instruction"] = meta["instruction"]
                     item["relevant_preferences"] = meta["relevant_preferences"]
+                    if meta.get("processing_time") is not None:
+                        item["processing_time"] = meta["processing_time"]
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
                     active_chunks.append(meta["text"])
         
@@ -560,6 +562,14 @@ class StreamSetup:
         # Calculate metrics
         total = len(generation_results) if generation_results else 1
         active_count = len(active_chunks)
+        
+        # Calculate processing time statistics
+        processing_times = [m.get("processing_time", 0) for m in self.chunk_metadata if m.get("processing_time") is not None]
+        avg_processing_time = np.mean(processing_times) if processing_times else 0
+        max_processing_time = np.max(processing_times) if processing_times else 0
+        min_processing_time = np.min(processing_times) if processing_times else 0
+        total_processing_time = np.sum(processing_times) if processing_times else 0
+        
         metrics = {
             "checkpoint_id": checkpoint_id,
             "docs_processed": self.stream_meta["total_docs_processed"],
@@ -571,6 +581,10 @@ class StreamSetup:
             "hallucination_of_preference_violation": evaluation_stats.get("hallucination_of_preference_violation", 0),
             "preference_unaware_violation": evaluation_stats.get("preference_unaware_violation", 0),
             "preference_following_accuracy": round((evaluation_stats.get("preference_adherence_accuracy", 0) / total) * 100, 2),
+            "avg_processing_time_per_chunk": round(avg_processing_time, 4),
+            "max_processing_time_per_chunk": round(max_processing_time, 4),
+            "min_processing_time_per_chunk": round(min_processing_time, 4),
+            "total_processing_time": round(total_processing_time, 2),
             "timestamp": datetime.now().isoformat()
         }
         
@@ -583,6 +597,9 @@ class StreamSetup:
         print(f"✅ Checkpoint #{checkpoint_id} evaluation complete")
         print(f"   Total indexed: {len(self.chunk_metadata)}, Active: {active_count}")
         print(f"   Accuracy: {metrics['preference_following_accuracy']}%")
+        if metrics.get('avg_processing_time_per_chunk', 0) > 0:
+            print(f"   Avg processing time per chunk: {metrics['avg_processing_time_per_chunk']:.4f}s")
+            print(f"   Total processing time: {metrics['total_processing_time']:.2f}s")
         
         return metrics
     
@@ -801,6 +818,7 @@ class StreamSetup:
     def run_stream(self, method_dir, preference_events=None, checkpoint_interval=None):
         """
         Run the full stream processing pipeline (document-by-document)
+        Supports resume from last processed document index
         
         Args:
             method_dir: Output directory for results
@@ -816,12 +834,36 @@ class StreamSetup:
         print(f"🚀 Starting Stream Processing (Document-by-Document)")
         print(f"{'='*60}")
         
-        stream_dir = os.path.join(method_dir, f"stream_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        os.makedirs(stream_dir, exist_ok=True)
+        # Try to find existing stream directory for resume
+        stream_dir = self._find_or_create_stream_dir(method_dir)
+        resume_info = self._load_resume_info(stream_dir)
         
         total_docs = len(self.all_chunks)
         checkpoint_interval = checkpoint_interval or self.batch_size
         num_checkpoints = (total_docs + checkpoint_interval - 1) // checkpoint_interval
+        
+        # Resume from last processed index
+        start_doc_idx = 0
+        checkpoint_id = 0
+        docs_since_checkpoint = 0
+        event_idx = 0
+        
+        if resume_info:
+            print(f"📂 Resuming from previous run...")
+            start_doc_idx = resume_info.get("last_processed_idx", 0) + 1
+            checkpoint_id = resume_info.get("last_checkpoint_id", 0)
+            docs_since_checkpoint = resume_info.get("docs_since_checkpoint", 0)
+            event_idx = resume_info.get("event_idx", 0)
+            
+            # Restore FAISS index and metadata
+            self._restore_state(stream_dir)
+            
+            print(f"   Last processed document: {start_doc_idx - 1}")
+            print(f"   Resuming from document: {start_doc_idx}")
+            print(f"   Last checkpoint: {checkpoint_id}")
+        else:
+            print(f"🆕 Starting new stream run...")
+            os.makedirs(stream_dir, exist_ok=True)
         
         print(f"Total documents: {total_docs}")
         print(f"Processing: Document-by-document")
@@ -834,12 +876,8 @@ class StreamSetup:
         else:
             preference_events = []
         
-        event_idx = 0
-        checkpoint_id = 0
-        docs_since_checkpoint = 0
-        
         # Process documents one by one
-        for doc_idx in tqdm(range(total_docs), desc="Processing documents"):
+        for doc_idx in tqdm(range(start_doc_idx, total_docs), desc="Processing documents", initial=start_doc_idx, total=total_docs):
             # Check for preference events
             while event_idx < len(preference_events):
                 event = preference_events[event_idx]
@@ -853,12 +891,18 @@ class StreamSetup:
             self._process_single_document(doc_idx)
             docs_since_checkpoint += 1
             
+            # Save progress periodically (every 100 documents)
+            if doc_idx % 100 == 0:
+                self._save_progress(stream_dir, doc_idx, checkpoint_id, docs_since_checkpoint, event_idx)
+            
             # Run checkpoint at intervals
             if docs_since_checkpoint >= checkpoint_interval:
                 checkpoint_id += 1
                 print(f"\n--- Checkpoint {checkpoint_id} at {self.stream_meta['total_docs_processed']} docs ---")
                 self.run_checkpoint_evaluation(checkpoint_id, stream_dir)
                 docs_since_checkpoint = 0
+                # Save progress after checkpoint
+                self._save_progress(stream_dir, doc_idx, checkpoint_id, docs_since_checkpoint, event_idx)
         
         # Final checkpoint if there are remaining docs
         if docs_since_checkpoint > 0:
@@ -868,6 +912,11 @@ class StreamSetup:
         
         # Save final stream results
         self._save_stream_results(stream_dir)
+        
+        # Clean up progress file on successful completion
+        progress_file = os.path.join(stream_dir, "progress.json")
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
         
         print(f"\n{'='*60}")
         print(f"✅ Stream Processing Complete")
@@ -894,6 +943,8 @@ class StreamSetup:
             3. If Keep -> Insight generation (for insight methods)
             4. Add to FAISS index
         """
+        process_start_time = time.time()
+        
         chunk = self.all_chunks[doc_idx]
         emb = self.all_embeddings[doc_idx]
         
@@ -973,21 +1024,23 @@ class StreamSetup:
         # ============================================
         # Step 3: Add to FAISS Index
         # ============================================
+        processing_time = time.time() - process_start_time
+        
         # For insight methods: use insight embedding for FAISS
         if self.method == "EPIC_insight" and insight:
             insight_emb = self.utils.embed_query_mp(insight)
             insight_emb = insight_emb / np.linalg.norm(insight_emb, axis=1, keepdims=True)
-            self._add_single_chunk_to_index(chunk, insight_emb.squeeze(0), final_prefs, insight, instruction)
+            self._add_single_chunk_to_index(chunk, insight_emb.squeeze(0), final_prefs, insight, instruction, processing_time)
         elif self.method == "EPIC_inst" and instruction:
             # For inst methods: use instruction embedding for FAISS
             instruction_emb = self.utils.embed_query_mp(instruction)
             instruction_emb = instruction_emb / np.linalg.norm(instruction_emb, axis=1, keepdims=True)
-            self._add_single_chunk_to_index(chunk, instruction_emb.squeeze(0), final_prefs, insight, instruction)
+            self._add_single_chunk_to_index(chunk, instruction_emb.squeeze(0), final_prefs, insight, instruction, processing_time)
         else:
             # For other methods: use chunk embedding
-            self._add_single_chunk_to_index(chunk, emb_norm, final_prefs, insight, instruction)
+            self._add_single_chunk_to_index(chunk, emb_norm, final_prefs, insight, instruction, processing_time)
     
-    def _add_single_chunk_to_index(self, chunk, embedding, preferences, insight=None, instruction=None):
+    def _add_single_chunk_to_index(self, chunk, embedding, preferences, insight=None, instruction=None, processing_time=None):
         """
         Add a single chunk to the FAISS index
         
@@ -997,6 +1050,7 @@ class StreamSetup:
             preferences: List of relevant preferences
             insight: Optional insight text (for EPIC_insight)
             instruction: Optional instruction text (for EPIC_inst)
+            processing_time: Time taken to process this chunk (in seconds)
         """
         chunk_id = self.next_chunk_id
         
@@ -1019,6 +1073,8 @@ class StreamSetup:
             metadata["insight"] = insight
         if instruction:
             metadata["instruction"] = instruction
+        if processing_time is not None:
+            metadata["processing_time"] = processing_time
         
         self.chunk_metadata.append(metadata)
         
@@ -1055,6 +1111,123 @@ class StreamSetup:
             else:
                 self.remove_preference(preference)
     
+    def _find_or_create_stream_dir(self, method_dir):
+        """Find existing stream directory or create new one"""
+        # Look for existing stream directories
+        if os.path.exists(method_dir):
+            stream_dirs = [d for d in os.listdir(method_dir) if d.startswith("stream_") and os.path.isdir(os.path.join(method_dir, d))]
+            if stream_dirs:
+                # Get most recent stream directory
+                stream_dirs.sort(reverse=True)
+                latest_dir = os.path.join(method_dir, stream_dirs[0])
+                progress_file = os.path.join(latest_dir, "progress.json")
+                if os.path.exists(progress_file):
+                    print(f"📂 Found existing stream directory: {latest_dir}")
+                    return latest_dir
+        
+        # Create new stream directory
+        stream_dir = os.path.join(method_dir, f"stream_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        return stream_dir
+    
+    def _load_resume_info(self, stream_dir):
+        """Load resume information from progress file"""
+        progress_file = os.path.join(stream_dir, "progress.json")
+        if os.path.exists(progress_file):
+            try:
+                return self.utils.load_json(progress_file)
+            except Exception as e:
+                print(f"⚠️ Failed to load progress file: {e}")
+                return None
+        return None
+    
+    def _save_progress(self, stream_dir, last_processed_idx, checkpoint_id, docs_since_checkpoint, event_idx):
+        """Save current progress for resume"""
+        progress_file = os.path.join(stream_dir, "progress.json")
+        progress_info = {
+            "last_processed_idx": last_processed_idx,
+            "last_checkpoint_id": checkpoint_id,
+            "docs_since_checkpoint": docs_since_checkpoint,
+            "event_idx": event_idx,
+            "total_docs_processed": self.stream_meta["total_docs_processed"],
+            "total_chunks_indexed": len(self.chunk_metadata),
+            "active_chunks": sum(1 for m in self.chunk_metadata if m["active"]),
+            "timestamp": datetime.now().isoformat()
+        }
+        self.utils.save_json(progress_file, progress_info)
+    
+    def _restore_state(self, stream_dir):
+        """Restore metadata from last checkpoint"""
+        try:
+            # Find the latest checkpoint directory
+            checkpoint_dirs = [d for d in os.listdir(stream_dir) if d.startswith("checkpoint_") and os.path.isdir(os.path.join(stream_dir, d))]
+            if not checkpoint_dirs:
+                print("⚠️ No checkpoints found, starting fresh...")
+                return
+            
+            # Get the latest checkpoint
+            checkpoint_dirs.sort(key=lambda x: int(x.split("_")[1]) if x.split("_")[1].isdigit() else 0, reverse=True)
+            latest_checkpoint_dir = os.path.join(stream_dir, checkpoint_dirs[0])
+            
+            # Load preference state from checkpoint
+            pref_state_file = os.path.join(latest_checkpoint_dir, "preference_state.json")
+            if os.path.exists(pref_state_file):
+                pref_state = self.utils.load_json(pref_state_file)
+                self.active_preferences = pref_state.get("active_preferences", [])
+                self.inactive_preferences = pref_state.get("inactive_preferences", [])
+                self.preference_history = pref_state.get("preference_history", [])
+                
+                # Recompute preference embeddings
+                self._compute_preference_embeddings()
+                
+                print(f"✅ Restored preference state from checkpoint {checkpoint_dirs[0]}")
+                print(f"   Active preferences: {len(self.active_preferences)}")
+            
+            # Load chunk metadata from kept.jsonl in checkpoint
+            kept_file = os.path.join(latest_checkpoint_dir, "kept.jsonl")
+            if os.path.exists(kept_file):
+                restored_chunks = 0
+                with open(kept_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.strip():
+                            item = json.loads(line)
+                            chunk_id = item.get("id", len(self.chunk_metadata))
+                            metadata = {
+                                "id": chunk_id,
+                                "text": item["text"],
+                                "insight": item.get("insight"),
+                                "instruction": item.get("instruction"),
+                                "relevant_preferences": item.get("relevant_preferences", []),
+                                "active": True,
+                                "added_at_docs": self.stream_meta.get("total_docs_processed", 0)
+                            }
+                            if item.get("processing_time") is not None:
+                                metadata["processing_time"] = item["processing_time"]
+                            self.chunk_metadata.append(metadata)
+                            
+                            # Update preference_to_chunks mapping
+                            for pref in metadata["relevant_preferences"]:
+                                if pref not in self.preference_to_chunks:
+                                    self.preference_to_chunks[pref] = set()
+                                self.preference_to_chunks[pref].add(chunk_id)
+                            
+                            restored_chunks += 1
+                
+                self.next_chunk_id = max([m["id"] for m in self.chunk_metadata], default=0) + 1
+                print(f"✅ Restored {restored_chunks} chunks from checkpoint")
+            
+            # Rebuild FAISS index from restored chunks (if needed for retrieval)
+            if self.chunk_metadata:
+                # FAISS will be rebuilt during processing, so we just initialize it
+                if self.faiss_index is None:
+                    self._init_faiss_index(self.embedding_dim)
+                
+        except Exception as e:
+            print(f"⚠️ Failed to restore state: {e}")
+            print(f"   Starting fresh...")
+            # Initialize fresh state if restore fails
+            if self.faiss_index is None:
+                self._init_faiss_index(self.embedding_dim)
+    
     def _save_stream_results(self, stream_dir):
         """Save final stream results and summary"""
         # Save all checkpoint results
@@ -1087,6 +1260,10 @@ class StreamSetup:
             "hallucination_of_preference_violation",
             "preference_unaware_violation",
             "preference_following_accuracy",
+            "avg_processing_time_per_chunk",
+            "max_processing_time_per_chunk",
+            "min_processing_time_per_chunk",
+            "total_processing_time",
             "timestamp"
         ]
         
@@ -1242,6 +1419,168 @@ class StreamSetup:
         plt.close()
         
         print(f"📈 Combined plot saved to: {plot_file}")
+    
+    def reprocess_with_new_preference_events(self, stream_dir, new_preference_events, 
+                                             start_from_checkpoint=None):
+        """
+        Reprocess an existing stream with new preference events
+        
+        This function allows you to re-run evaluation with different preference
+        event timings without reprocessing all documents.
+        
+        Args:
+            stream_dir: Existing stream directory
+            new_preference_events: New preference events to apply
+            start_from_checkpoint: Checkpoint ID to start from (None = from beginning)
+        
+        Returns:
+            dict: Updated stream results
+        """
+        print(f"\n{'='*60}")
+        print(f"🔄 Reprocessing Stream with New Preference Events")
+        print(f"{'='*60}")
+        
+        # Load existing stream metadata
+        meta_file = os.path.join(stream_dir, "stream_metadata.json")
+        if not os.path.exists(meta_file):
+            print(f"❌ Stream metadata not found: {meta_file}")
+            return None
+        
+        stream_meta = self.utils.load_json(meta_file)
+        original_preference_history = stream_meta.get("preference_events", [])
+        
+        print(f"📂 Original preference events: {len(original_preference_history)}")
+        print(f"📂 New preference events: {len(new_preference_events)}")
+        
+        # Find checkpoints
+        checkpoint_dirs = [d for d in os.listdir(stream_dir) 
+                         if d.startswith("checkpoint_") and os.path.isdir(os.path.join(stream_dir, d))]
+        checkpoint_dirs.sort(key=lambda x: int(x.split("_")[1]) if x.split("_")[1].isdigit() else 0)
+        
+        if not checkpoint_dirs:
+            print("❌ No checkpoints found to reprocess")
+            return None
+        
+        # Determine starting checkpoint
+        if start_from_checkpoint is None:
+            start_checkpoint_id = 1
+        else:
+            start_checkpoint_id = start_from_checkpoint
+        
+        print(f"🔄 Starting reprocessing from checkpoint {start_checkpoint_id}")
+        
+        # Restore state from the checkpoint before start_checkpoint_id
+        if start_checkpoint_id > 1:
+            prev_checkpoint_dir = os.path.join(stream_dir, f"checkpoint_{start_checkpoint_id - 1}")
+            if os.path.exists(prev_checkpoint_dir):
+                self._restore_state_from_checkpoint(prev_checkpoint_dir)
+                print(f"✅ Restored state from checkpoint {start_checkpoint_id - 1}")
+        
+        # Update preference history with new events
+        self.preference_history = []
+        self.stream_meta["preference_events"] = []
+        
+        # Apply new preference events up to current point
+        current_docs = self.stream_meta.get("total_docs_processed", 0)
+        for event in sorted(new_preference_events, key=lambda x: x.get("at_docs", 0)):
+            if event.get("at_docs", 0) <= current_docs:
+                self._handle_preference_event(event)
+        
+        # Reprocess checkpoints
+        updated_checkpoint_results = []
+        for checkpoint_dir_name in checkpoint_dirs:
+            checkpoint_id = int(checkpoint_dir_name.split("_")[1])
+            if checkpoint_id < start_checkpoint_id:
+                # Keep original results
+                metrics_file = os.path.join(stream_dir, checkpoint_dir_name, "metrics.json")
+                if os.path.exists(metrics_file):
+                    original_metrics = self.utils.load_json(metrics_file)
+                    updated_checkpoint_results.append(original_metrics)
+                continue
+            
+            checkpoint_dir = os.path.join(stream_dir, checkpoint_dir_name)
+            
+            # Apply preference events that occurred before this checkpoint
+            checkpoint_meta = self.utils.load_json(os.path.join(checkpoint_dir, "metrics.json"))
+            checkpoint_docs = checkpoint_meta.get("docs_processed", 0)
+            
+            for event in sorted(new_preference_events, key=lambda x: x.get("at_docs", 0)):
+                event_docs = event.get("at_docs", 0)
+                if event_docs <= checkpoint_docs:
+                    # Check if already applied
+                    already_applied = any(
+                        e.get("at_docs") == event_docs and e.get("type") == event.get("type")
+                        for e in self.preference_history
+                    )
+                    if not already_applied:
+                        self._handle_preference_event(event)
+            
+            # Re-run evaluation for this checkpoint
+            print(f"\n🔄 Reprocessing checkpoint {checkpoint_id}...")
+            metrics = self.run_checkpoint_evaluation(checkpoint_id, stream_dir)
+            if metrics:
+                updated_checkpoint_results.append(metrics)
+        
+        # Update stream results
+        self.checkpoint_results = updated_checkpoint_results
+        self._save_stream_results(stream_dir)
+        
+        print(f"\n✅ Reprocessing complete!")
+        print(f"   Updated {len(updated_checkpoint_results)} checkpoints")
+        
+        return {
+            "stream_dir": stream_dir,
+            "checkpoints": updated_checkpoint_results,
+            "metadata": self.stream_meta
+        }
+    
+    def _restore_state_from_checkpoint(self, checkpoint_dir):
+        """Restore stream state from a specific checkpoint"""
+        # Load preference state
+        pref_state_file = os.path.join(checkpoint_dir, "preference_state.json")
+        if os.path.exists(pref_state_file):
+            pref_state = self.utils.load_json(pref_state_file)
+            self.active_preferences = pref_state.get("active_preferences", [])
+            self.inactive_preferences = pref_state.get("inactive_preferences", [])
+            self.preference_history = pref_state.get("preference_history", [])
+            self._compute_preference_embeddings()
+        
+        # Load chunk metadata from kept.jsonl
+        kept_file = os.path.join(checkpoint_dir, "kept.jsonl")
+        if os.path.exists(kept_file):
+            self.chunk_metadata = []
+            self.preference_to_chunks = {}
+            
+            with open(kept_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        item = json.loads(line)
+                        chunk_id = item.get("id", len(self.chunk_metadata))
+                        metadata = {
+                            "id": chunk_id,
+                            "text": item["text"],
+                            "insight": item.get("insight"),
+                            "instruction": item.get("instruction"),
+                            "relevant_preferences": item.get("relevant_preferences", []),
+                            "active": True,
+                            "added_at_docs": item.get("added_at_docs", 0)
+                        }
+                        if item.get("processing_time") is not None:
+                            metadata["processing_time"] = item["processing_time"]
+                        
+                        self.chunk_metadata.append(metadata)
+                        
+                        # Update preference_to_chunks mapping
+                        for pref in metadata["relevant_preferences"]:
+                            if pref not in self.preference_to_chunks:
+                                self.preference_to_chunks[pref] = set()
+                            self.preference_to_chunks[pref].add(chunk_id)
+            
+            self.next_chunk_id = max([m["id"] for m in self.chunk_metadata], default=0) + 1
+            
+            # Rebuild FAISS index (simplified - would need actual embeddings)
+            # For now, we'll need to reload from original data
+            print(f"⚠️ Note: FAISS index needs to be rebuilt from original data")
 
 
 class StreamManager:
@@ -1310,31 +1649,94 @@ class StreamManager:
         
         return sorted(events, key=lambda x: x["at_docs"])
     
-    def create_fixed_preference_events(self, batch_size=2000):
+    def create_fixed_preference_events(self, batch_size=2000, total_docs=10000, 
+                                       num_add=1, num_remove=1, seed=None):
         """
-        Create fixed preference events at specific checkpoints
+        Create random preference events avoiding checkpoint timings
         
-        - 2nd checkpoint (after 2 batches): Remove one preference
-        - 4th checkpoint (after 4 batches): Add one preference
+        Preference events are randomly placed in the document stream,
+        but avoid checkpoint evaluation timings to ensure stable evaluation.
         
         Args:
-            batch_size: Batch size for determining event timing
+            batch_size: Batch size (checkpoint interval)
+            total_docs: Total number of documents
+            num_add: Number of preference add events
+            num_remove: Number of preference remove events
+            seed: Random seed for reproducibility
         
         Returns:
-            list: Preference events
+            list: Preference events sorted by at_docs
         """
-        events = [
-            {
-                "type": "remove",
-                "at_docs": batch_size * 2,  # After 2nd batch (e.g., 4000 docs)
-                "preference": None  # Will remove random active preference
-            },
-            {
-                "type": "add",
-                "at_docs": batch_size * 4,  # After 4th batch (e.g., 8000 docs)
-                "preference": None  # Will get random from other persona
-            }
-        ]
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+        
+        # Calculate checkpoint timings
+        checkpoint_timings = set()
+        checkpoint_interval = batch_size
+        for i in range(1, (total_docs // checkpoint_interval) + 1):
+            checkpoint_timings.add(i * checkpoint_interval)
+        
+        # Also avoid a window around checkpoints (±100 docs)
+        checkpoint_windows = set()
+        for cp_time in checkpoint_timings:
+            for offset in range(-100, 101):
+                checkpoint_windows.add(cp_time + offset)
+        
+        # Generate random event timings avoiding checkpoint windows
+        events = []
+        min_docs = max(100, checkpoint_interval)  # Start after first checkpoint
+        max_docs = total_docs - checkpoint_interval  # End before last checkpoint
+        
+        # Generate "remove" events
+        for _ in range(num_remove):
+            attempts = 0
+            while attempts < 100:  # Try up to 100 times
+                at_docs = random.randint(min_docs, max_docs)
+                if at_docs not in checkpoint_windows:
+                    events.append({
+                        "type": "remove",
+                        "at_docs": at_docs,
+                        "preference": None  # Will remove random active preference
+                    })
+                    break
+                attempts += 1
+            if attempts >= 100:
+                # Fallback: use midpoint between checkpoints
+                mid_point = (min_docs + max_docs) // 2
+                events.append({
+                    "type": "remove",
+                    "at_docs": mid_point,
+                    "preference": None
+                })
+        
+        # Generate "add" events
+        for _ in range(num_add):
+            attempts = 0
+            while attempts < 100:
+                at_docs = random.randint(min_docs, max_docs)
+                if at_docs not in checkpoint_windows:
+                    events.append({
+                        "type": "add",
+                        "at_docs": at_docs,
+                        "preference": None  # Will get random from other persona
+                    })
+                    break
+                attempts += 1
+            if attempts >= 100:
+                mid_point = (min_docs + max_docs) // 2
+                events.append({
+                    "type": "add",
+                    "at_docs": mid_point,
+                    "preference": None
+                })
+        
+        # Sort by at_docs
+        events = sorted(events, key=lambda x: x["at_docs"])
+        
+        print(f"📅 Generated {len(events)} preference events (avoiding checkpoint timings)")
+        for event in events:
+            print(f"   - {event['type'].upper()} at {event['at_docs']} docs")
         
         return events
 
