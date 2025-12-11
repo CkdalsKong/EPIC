@@ -99,12 +99,7 @@ class EPICIndexing:
         # For EPIC method: load cosine filtering results from cosine method's output
         if self.method in ["EPIC", "EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:
             # Find cosine method's output directory path
-            if self.utils.llm_model_name == "openai/gpt-oss-20b":
-                cosine_method_dir = os.path.join(self.output_dir, f"cosine_oss/{persona_index}")
-            elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
-                cosine_method_dir = os.path.join(self.output_dir, f"cosine_qwen/{persona_index}")
-            else:
-                cosine_method_dir = os.path.join(self.output_dir, f"cosine/{persona_index}")
+            cosine_method_dir = os.path.join(self.output_dir, f"cosine/{persona_index}")
             
             cosine_filtering_file = os.path.join(cosine_method_dir, "cosine_filtering_results.jsonl")
             

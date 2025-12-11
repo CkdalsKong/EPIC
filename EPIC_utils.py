@@ -34,7 +34,7 @@ class EPICUtils:
     def __init__(self, mode, method, device, output_dir, dataset=None, emb_model_name="facebook/contriever", doc_mode="wiki", vllm_server_url="http://localhost:8008/v1", llm_model_name="meta-llama/Llama-3.1-8B-Instruct", use_local_llm=False):
 
         self.root_dir = "data"
-        self.root_dir_corpus = "data/corpus"
+        self.root_dir_corpus = "../data/corpus"
         self.top_k = 5
 
         self.prompt_dir = "prompt"
