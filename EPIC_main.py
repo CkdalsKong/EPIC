@@ -157,14 +157,15 @@ class EPICMain:
             for event in preference_events:
                 print(f"      - {event['type'].upper()} at {event['at_docs']} docs")
             
-            # Run stream experiment
+            # Run stream experiment (skip evaluation by default)
             stream = self.stream_manager.run_stream_experiment(
                 persona_index=persona_index,
                 all_chunks=cached_resources["chunks"],
                 all_embeddings=cached_resources["embeddings"],
                 method_dir=method_dir,
                 batch_size=self.stream_batch_size,
-                preference_events=preference_events
+                preference_events=preference_events,
+                skip_evaluation=True  # Skip evaluation during checkpoint
             )
             print(f"✅ Stream processing completed. Results saved to stream directory.")
         

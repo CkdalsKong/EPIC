@@ -25,7 +25,7 @@ class StreamSetup:
     Uses incremental FAISS updates with metadata management for efficiency.
     """
     
-    def __init__(self, utils, batch_size=2000):
+    def __init__(self, utils, batch_size=2000, skip_evaluation=False):
         self.utils = utils
         self.method = utils.method
         self.device = utils.device
@@ -33,6 +33,7 @@ class StreamSetup:
         self.emb_model_name = utils.emb_model_name
         self.doc_mode = utils.doc_mode
         self.batch_size = batch_size  # Documents per batch (default: 2000)
+        self.skip_evaluation = skip_evaluation  # Skip evaluation during checkpoint
         
         # Stream state - using metadata-based management
         self.chunk_metadata = []  # [{id, text, insight, relevant_preferences, active}]
@@ -556,8 +557,12 @@ class StreamSetup:
         # Run generation for a subset of queries
         generation_results = self._run_generation(index, checkpoint_dir, active_chunks)
         
-        # Run evaluation on generated results
-        evaluation_stats = self._run_evaluation(generation_results, checkpoint_dir)
+        # Run evaluation on generated results (skip if flag is set)
+        if self.skip_evaluation:
+            print(f"⏭️ Skipping evaluation (skip_evaluation=True)")
+            evaluation_stats = {}
+        else:
+            evaluation_stats = self._run_evaluation(generation_results, checkpoint_dir)
         
         # Calculate metrics
         total = len(generation_results) if generation_results else 1
@@ -580,7 +585,7 @@ class StreamSetup:
             "inconsistent": evaluation_stats.get("error_inconsistent", 0),
             "hallucination_of_preference_violation": evaluation_stats.get("hallucination_of_preference_violation", 0),
             "preference_unaware_violation": evaluation_stats.get("preference_unaware_violation", 0),
-            "preference_following_accuracy": round((evaluation_stats.get("preference_adherence_accuracy", 0) / total) * 100, 2),
+            "preference_following_accuracy": round((evaluation_stats.get("preference_adherence_accuracy", 0) / total) * 100, 2) if not self.skip_evaluation else 0,
             "avg_processing_time_per_chunk": round(avg_processing_time, 4),
             "max_processing_time_per_chunk": round(max_processing_time, 4),
             "min_processing_time_per_chunk": round(min_processing_time, 4),
@@ -594,9 +599,10 @@ class StreamSetup:
         # Save checkpoint results
         self._save_checkpoint_results(checkpoint_dir, metrics)
         
-        print(f"✅ Checkpoint #{checkpoint_id} evaluation complete")
+        print(f"✅ Checkpoint #{checkpoint_id} complete")
         print(f"   Total indexed: {len(self.chunk_metadata)}, Active: {active_count}")
-        print(f"   Accuracy: {metrics['preference_following_accuracy']}%")
+        if not self.skip_evaluation:
+            print(f"   Accuracy: {metrics['preference_following_accuracy']}%")
         if metrics.get('avg_processing_time_per_chunk', 0) > 0:
             print(f"   Avg processing time per chunk: {metrics['avg_processing_time_per_chunk']:.4f}s")
             print(f"   Total processing time: {metrics['total_processing_time']:.2f}s")
@@ -1592,7 +1598,7 @@ class StreamManager:
         self.utils = utils
     
     def run_stream_experiment(self, persona_index, all_chunks, all_embeddings, 
-                              method_dir, batch_size=2000, preference_events=None):
+                              method_dir, batch_size=2000, preference_events=None, skip_evaluation=False):
         """
         Run a complete stream experiment
         
@@ -1603,11 +1609,12 @@ class StreamManager:
             method_dir: Output directory
             batch_size: Documents per batch
             preference_events: List of preference change events
+            skip_evaluation: Skip evaluation during checkpoints (default: False)
         
         Returns:
             StreamSetup instance with results
         """
-        stream = StreamSetup(self.utils, batch_size=batch_size)
+        stream = StreamSetup(self.utils, batch_size=batch_size, skip_evaluation=skip_evaluation)
         stream.initialize_stream(persona_index, all_chunks, all_embeddings)
         stream.run_stream(method_dir, preference_events)
         

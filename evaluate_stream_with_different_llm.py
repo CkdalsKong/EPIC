@@ -36,10 +36,11 @@ class StreamEvaluator:
     
     def find_stream_directories(self, base_dir: str) -> List[str]:
         """
-        Stream 디렉토리들을 찾기
+        Stream 디렉토리들을 재귀적으로 찾기
         
         Args:
-            base_dir: 메소드 디렉토리 (예: output_prefeval/EPIC_inst/1)
+            base_dir: 메소드 디렉토리 (예: stream/lmsys_sampled/EPIC_inst/)
+                    또는 특정 persona 디렉토리 (예: stream/lmsys_sampled/EPIC_inst/1)
         
         Returns:
             List of stream directory paths
@@ -49,11 +50,23 @@ class StreamEvaluator:
             print(f"❌ 디렉토리가 존재하지 않습니다: {base_dir}")
             return []
         
-        # stream_으로 시작하는 디렉토리 찾기
+        # stream_으로 시작하는 디렉토리 재귀적으로 찾기
         stream_dirs = []
-        for item in base_path.iterdir():
-            if item.is_dir() and item.name.startswith("stream_"):
-                stream_dirs.append(str(item))
+        
+        def search_recursive(path: Path):
+            """재귀적으로 stream_ 디렉토리 찾기"""
+            try:
+                for item in path.iterdir():
+                    if item.is_dir():
+                        if item.name.startswith("stream_"):
+                            stream_dirs.append(str(item))
+                        else:
+                            # 하위 디렉토리도 탐색
+                            search_recursive(item)
+            except PermissionError:
+                pass  # 권한 없는 디렉토리는 건너뛰기
+        
+        search_recursive(base_path)
         
         # 최신 순으로 정렬
         stream_dirs.sort(reverse=True)
@@ -63,7 +76,7 @@ class StreamEvaluator:
         else:
             print(f"✅ {len(stream_dirs)}개의 Stream 디렉토리 발견")
             for sd in stream_dirs:
-                print(f"   - {os.path.basename(sd)}")
+                print(f"   - {sd}")
         
         return stream_dirs
     

@@ -42,7 +42,7 @@ class EvaluationWithDifferentLLM:
         self.retry_count = retry_count
         
         # 평가 메트릭 파일 경로
-        self.error_type_dir = "data/error_type"
+        self.error_type_dir = "prompt/error_type"
         
         # 서버 연결 확인
         self.check_server_connection()
