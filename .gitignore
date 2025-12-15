@@ -7,6 +7,7 @@ __pycache__/
 sampled*
 lmsys_chat1m_*
 stream*/
+run_stream_jetson.sh
 # Docker files (local only)
 Dockerfile
 docker_init.sh
