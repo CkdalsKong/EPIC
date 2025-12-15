@@ -64,6 +64,7 @@ class StreamSetup:
         self.all_chunks = all_chunks
         self.all_embeddings = all_embeddings
         
+        
         # Load persona data
         self.persona = self.utils.load_persona_data(persona_index)
         self.active_preferences = [block["preference"] for block in self.persona["preference_blocks"]]
@@ -688,6 +689,11 @@ class StreamSetup:
         # Compute query embedding
         query_emb = self.utils.embed_query_mp(question)
         
+        # For standard method: no preference weighting
+        if self.method == "standard":
+            # Search without preference weighting
+            return self.search_active_chunks(query_emb, top_k)
+        
         # Add preference weighting
         if self.preference_embeddings is not None and len(self.active_preferences) > 0:
             pref_sims = np.dot(self.preference_embeddings, query_emb.T).squeeze()
@@ -961,6 +967,15 @@ class StreamSetup:
         self.stream_meta["total_docs_processed"] += 1
         
         # ============================================
+        # Standard method: Save all chunks without filtering
+        # ============================================
+        if self.method == "standard":
+            processing_time = time.time() - process_start_time
+            # Save all chunks with empty preferences (no preference filtering)
+            self._add_single_chunk_to_index(chunk, emb_norm, [], None, None, processing_time)
+            return
+        
+        # ============================================
         # Step 1: Cosine Filtering
         # ============================================
         cosine_passed = False
@@ -979,6 +994,13 @@ class StreamSetup:
             # No preferences, keep all
             cosine_passed = True
             cosine_relevant_prefs = self.active_preferences[:]
+        
+        # For cosine method: save if cosine filtering passed, skip LLM filtering
+        if self.method == "cosine":
+            if cosine_passed:
+                processing_time = time.time() - process_start_time
+                self._add_single_chunk_to_index(chunk, emb_norm, cosine_relevant_prefs, None, None, processing_time)
+            return
         
         # If cosine filtering failed, skip this document
         if not cosine_passed:

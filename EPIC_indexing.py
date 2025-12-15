@@ -87,6 +87,54 @@ class EPICIndexing:
 
         print(self.utils.threshold)
         
+        # For standard method: save all chunks without filtering
+        if self.method == "standard":
+            print("\n=== Standard method: Saving all chunks without filtering ===")
+            print(f"Total chunks: {len(chunks)}")
+            
+            # Generate embeddings for all chunks
+            print("Generating embeddings for all chunks...")
+            embeddings = chunk_embeddings_norm.copy()
+            
+            # Create FAISS index
+            dim = embeddings.shape[1]
+            print(f"Creating FAISS IndexFlatIP (dim={dim})...")
+            index = faiss.IndexFlatIP(dim)
+            index.add(embeddings.astype(np.float32))
+            
+            # Save FAISS index and embeddings (save to both data_dir and method_dir for compatibility)
+            faiss.write_index(index, index_file)
+            print(f"✅ FAISS index saved to {index_file}")
+            np.save(embeddings_file, embeddings)
+            print(f"✅ Embeddings saved to {embeddings_file}")
+            
+            # Also save to method_dir for consistency
+            method_index_file = os.path.join(method_dir, f"index_{model_name_clean}.faiss")
+            method_embeddings_file = os.path.join(method_dir, f"embeddings_{model_name_clean}.npy")
+            faiss.write_index(index, method_index_file)
+            np.save(method_embeddings_file, embeddings)
+            
+            # Save all chunks
+            kept_file = os.path.join(method_dir, "kept.jsonl")
+            self.utils.save_jsonl(kept_file, [{"text": chunk} for chunk in chunks])
+            print(f"✅ All chunks saved to {kept_file}")
+            
+            total_time = time.time() - start_total
+            print(f"\n=== Completed standard indexing for persona {persona_index} ===")
+            print(f"Total time: {total_time:.2f} seconds")
+            
+            # Generate report
+            fieldnames = ["method", "persona_index", "total_chunks", "total_time(s)"]
+            row = {
+                "method": f"{self.method}{llm_name}",
+                "persona_index": f"{persona_index}",
+                "total_chunks": len(chunks),
+                "total_time(s)": f"{total_time:.2f}"
+            }
+            self.utils.save_csv(os.path.join(self.output_dir, self.utils.indexing_report_file), fieldnames, row)
+            
+            return method_dir
+        
         print("\nStarting cosine similarity filtering...")
         kept_save, kept_chunks, filtered_save = [], [], []
         relevant_preferences = []

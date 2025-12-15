@@ -139,11 +139,23 @@ class StreamEvaluator:
             print(f"   ⏭️ Checkpoint {checkpoint_id} 이미 평가됨 (건너뛰기)")
             try:
                 stats = self.evaluator.analyze_evaluation_results(output_file)
-                return {
+                # Stream 형식의 메트릭 생성 (새로 평가한 경우와 동일한 구조)
+                total = stats.get("total_responses", 0)
+                if total == 0:
+                    print(f"   ⚠️ Checkpoint {checkpoint_id}: 평가 결과가 없습니다")
+                    return None
+                
+                metrics = {
                     "checkpoint_id": checkpoint_id,
-                    "stats": stats,
+                    "unhelpful": stats.get("error_unhelpful", 0),
+                    "inconsistent": stats.get("error_inconsistent", 0),
+                    "hallucination_of_preference_violation": stats.get("hallucination_of_preference_violation", 0),
+                    "preference_unaware_violation": stats.get("preference_unaware_violation", 0),
+                    "preference_following_accuracy": stats.get("preference_following_accuracy_percent", 0),
+                    "total_responses": total,
                     "evaluated_file": output_file
                 }
+                return metrics
             except Exception as e:
                 print(f"   ⚠️ 기존 결과 로드 실패, 재평가: {str(e)}")
         

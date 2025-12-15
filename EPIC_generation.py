@@ -39,8 +39,29 @@ class EPICGeneration:
         # Get query embedding
         query_emb = self.utils.embed_query_mp(question)
         
+        # For standard method: simple retrieval without preference filtering
+        if self.method == "standard":
+            top_k = self.utils.top_k
+            D, I = index.search(query_emb.astype(np.float32), top_k)
+            
+            # Get chunks from metadata or use direct index
+            if chunk_metadata:
+                retrieved = [chunk_metadata[idx]["text"] if idx < len(chunk_metadata) else "" for idx in I[0]]
+            else:
+                # Fallback: load from kept.jsonl
+                kept_file = os.path.join(method_dir, "kept.jsonl")
+                if os.path.exists(kept_file):
+                    with open(kept_file, "r", encoding="utf-8") as f:
+                        all_chunks = [json.loads(line)["text"] for line in f]
+                        retrieved = [all_chunks[idx] if idx < len(all_chunks) else "" for idx in I[0]]
+                else:
+                    retrieved = []
+            
+            retrieval_time = time.time() - start_retrieval
+            context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved) if doc])
+        
         # For insight/inst methods: find top-1 preference and filter by preference_ids
-        if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"] and chunk_metadata is not None:
+        elif self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"] and chunk_metadata is not None:
             # Find top-1 preference for this query
             preference_embs = []
             for pref in preferences:
@@ -161,19 +182,22 @@ class EPICGeneration:
         kept_file = os.path.join(method_dir, "kept.jsonl")
         chunk_metadata = []
         
-        with open(kept_file, "r", encoding="utf-8") as f:
-            for line in f:
-                item = json.loads(line)
-                chunk_metadata.append({
-                    "text": item["text"],
-                    # Handle different field names from different methods
-                    "preference_ids": item.get("relevant_preferences", item.get("preference_ids", item.get("relevant_preference", []))),
-                    "instruction": item.get("instruction", ""),
-                    "insight": item.get("insight", ""),
-                    "reason": item.get("reason", "")
-                })
-        
-        print(f"✅ Loaded {len(chunk_metadata)} chunks with metadata")
+        if os.path.exists(kept_file):
+            with open(kept_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    item = json.loads(line)
+                    chunk_metadata.append({
+                        "text": item["text"],
+                        # Handle different field names from different methods
+                        "preference_ids": item.get("relevant_preferences", item.get("preference_ids", item.get("relevant_preference", []))),
+                        "instruction": item.get("instruction", ""),
+                        "insight": item.get("insight", ""),
+                        "reason": item.get("reason", "")
+                    })
+            
+            print(f"✅ Loaded {len(chunk_metadata)} chunks with metadata")
+        else:
+            print(f"⚠️ No kept.jsonl found at {kept_file}")
         
         # Count chunks per preference for insight/inst methods
         if self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"]:

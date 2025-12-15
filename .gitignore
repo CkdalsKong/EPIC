@@ -6,7 +6,7 @@ __pycache__/
 .idea/
 sampled*
 lmsys_chat1m_*
-stream_prefeval/
+stream*/
 # Docker files (local only)
 Dockerfile
 docker_init.sh
