@@ -34,13 +34,14 @@ class StreamEvaluator:
         """
         self.evaluator = evaluator
     
-    def find_stream_directories(self, base_dir: str) -> List[str]:
+    def find_stream_directories(self, base_dir: str, persona_indices: Optional[List[int]] = None) -> List[str]:
         """
         Stream 디렉토리들을 재귀적으로 찾기
         
         Args:
             base_dir: 메소드 디렉토리 (예: stream/lmsys_sampled/EPIC_inst/)
                     또는 특정 persona 디렉토리 (예: stream/lmsys_sampled/EPIC_inst/1)
+            persona_indices: 필터링할 persona 인덱스 리스트 (None이면 모든 persona)
         
         Returns:
             List of stream directory paths
@@ -59,6 +60,21 @@ class StreamEvaluator:
                 for item in path.iterdir():
                     if item.is_dir():
                         if item.name.startswith("stream_"):
+                            # persona 필터링
+                            if persona_indices is not None:
+                                # 경로에서 persona 인덱스 추출
+                                # 예: stream_prefwiki/wiki/EPIC_inst/0/stream_20251216_132324
+                                # stream_ 디렉토리의 부모 디렉토리가 persona 인덱스
+                                parent_dir = item.parent
+                                parent_name = parent_dir.name
+                                
+                                # 부모 디렉토리명이 숫자인지 확인
+                                if parent_name.isdigit():
+                                    persona_found = int(parent_name)
+                                    # persona 필터링 적용
+                                    if persona_found not in persona_indices:
+                                        continue
+                            
                             stream_dirs.append(str(item))
                         else:
                             # 하위 디렉토리도 탐색
@@ -73,8 +89,12 @@ class StreamEvaluator:
         
         if not stream_dirs:
             print(f"⚠️ Stream 디렉토리를 찾을 수 없습니다: {base_dir}")
+            if persona_indices:
+                print(f"   (필터링: persona {persona_indices})")
         else:
             print(f"✅ {len(stream_dirs)}개의 Stream 디렉토리 발견")
+            if persona_indices:
+                print(f"   (필터링: persona {persona_indices})")
             for sd in stream_dirs:
                 print(f"   - {sd}")
         
@@ -474,7 +494,9 @@ def main():
     parser.add_argument('--stream_dir', type=str, default=None,
                        help='Stream 디렉토리 경로 (지정하지 않으면 base_dir에서 자동 검색)')
     parser.add_argument('--base_dir', type=str, default=None,
-                       help='메소드 디렉토리 (예: output_prefeval/EPIC_inst/1)')
+                       help='메소드 디렉토리 (예: stream_prefwiki/wiki/EPIC_inst)')
+    parser.add_argument('--persona_index', type=str, default=None,
+                       help='평가할 persona 인덱스 (예: "0", "0,1,2", "all" - 기본값: all)')
     parser.add_argument('--vllm_url', type=str, default='http://localhost:8011',
                        help='vLLM 서버 URL')
     parser.add_argument('--eval_model', type=str, default='meta-llama/Llama-3.3-70B-Instruct',
@@ -483,6 +505,17 @@ def main():
                        help='기존 평가 결과를 덮어쓰기')
     
     args = parser.parse_args()
+    
+    # Persona 인덱스 파싱
+    persona_indices = None
+    if args.persona_index and args.persona_index.lower() != 'all':
+        try:
+            persona_indices = [int(x.strip()) for x in args.persona_index.split(',')]
+            print(f"📊 선택된 persona 평가: {persona_indices}")
+        except ValueError:
+            print(f"❌ 잘못된 persona_index 형식: {args.persona_index}")
+            print(f"   예시: '0', '0,1,2', 'all'")
+            return
     
     # 평가기 초기화
     evaluator = EvaluationWithDifferentLLM(
@@ -500,7 +533,7 @@ def main():
     if args.stream_dir:
         stream_dirs = [args.stream_dir]
     elif args.base_dir:
-        stream_dirs = stream_evaluator.find_stream_directories(args.base_dir)
+        stream_dirs = stream_evaluator.find_stream_directories(args.base_dir, persona_indices)
     else:
         print("❌ --stream_dir 또는 --base_dir 중 하나를 지정해야 합니다")
         return

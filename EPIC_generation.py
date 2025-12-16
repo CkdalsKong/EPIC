@@ -39,26 +39,15 @@ class EPICGeneration:
         # Get query embedding
         query_emb = self.utils.embed_query_mp(question)
         
-        # For standard method: simple retrieval without preference filtering
+        # For standard method: use retrieve_top_k (mydata style)
         if self.method == "standard":
-            top_k = self.utils.top_k
-            D, I = index.search(query_emb.astype(np.float32), top_k)
-            
-            # Get chunks from metadata or use direct index
-            if chunk_metadata:
-                retrieved = [chunk_metadata[idx]["text"] if idx < len(chunk_metadata) else "" for idx in I[0]]
-            else:
-                # Fallback: load from kept.jsonl
-                kept_file = os.path.join(method_dir, "kept.jsonl")
-                if os.path.exists(kept_file):
-                    with open(kept_file, "r", encoding="utf-8") as f:
-                        all_chunks = [json.loads(line)["text"] for line in f]
-                        retrieved = [all_chunks[idx] if idx < len(all_chunks) else "" for idx in I[0]]
-                else:
-                    retrieved = []
-            
-            retrieval_time = time.time() - start_retrieval
-            context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved) if doc])
+            filtered_chunks = [m["text"] for m in chunk_metadata] if chunk_metadata else []
+            retrieved, retrieval_time = self.utils.retrieve_top_k(
+                question,
+                index,
+                filtered_chunks
+            )
+            context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved)])
         
         # For insight/inst methods: find top-1 preference and filter by preference_ids
         elif self.method in ["EPIC_inst", "EPIC_inst_combined", "EPIC_insight", "EPIC_insight_combined"] and chunk_metadata is not None:
@@ -106,8 +95,17 @@ class EPICGeneration:
                 else:
                     context_parts.append(f"Document {i+1}: {doc}")
             context = "\n\n".join(context_parts)
+        elif self.method == "cosine":
+            # Cosine method: use retrieve_top_k (mydata style)
+            filtered_chunks = [m["text"] for m in chunk_metadata] if chunk_metadata else []
+            retrieved, retrieval_time = self.utils.retrieve_top_k(
+                question,
+                index,
+                filtered_chunks
+            )
+            context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved)])
         else:
-            # Original cosine method: no preference filtering
+            # Other methods: use retrieve_top_k_wq_cosine
             filtered_chunks = [m["text"] for m in chunk_metadata] if chunk_metadata else []
             retrieved, retrieval_time = self.utils.retrieve_top_k_wq_cosine(
                 question,
@@ -150,14 +148,18 @@ class EPICGeneration:
     def run_generation_with_cache(self, persona_index, method_dir, cached_resources):
         print(f"\n=== Starting generation for persona {persona_index} ===")
 
-        if self.utils.dataset_name == "PrefWiki":
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
-        elif self.utils.dataset_name == "PrefELI5":
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
-        elif self.utils.dataset_name == "PrefRQ":
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
-        elif self.utils.dataset_name == "PrefEval":
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+        # For standard method: use common directory (mydata style)
+        if self.method == "standard":
+            data_dir = self.utils.data_dir
+        else:
+            if self.utils.dataset_name == "PrefWiki":
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            elif self.utils.dataset_name == "PrefELI5":
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            elif self.utils.dataset_name == "PrefRQ":
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            elif self.utils.dataset_name == "PrefEval":
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
             
         # Determine index file path based on index type
         model_name_clean = self.emb_model_name.replace("/", "_")
@@ -169,17 +171,26 @@ class EPICGeneration:
         preference_list = [block["preference"] for block in persona["preference_blocks"]]
 
         # Load unified FAISS index and metadata (same approach for all methods)
-        index_file = os.path.join(method_dir, f"index_{model_name_clean}.faiss")
-        if not os.path.exists(index_file):
-            # Fallback to data_dir if not in method_dir
+        # For standard method: use data_dir directly (mydata style)
+        if self.method == "standard":
             index_file = os.path.join(data_dir, f"index_{model_name_clean}.faiss")
+        else:
+            index_file = os.path.join(method_dir, f"index_{model_name_clean}.faiss")
+            if not os.path.exists(index_file):
+                # Fallback to data_dir if not in method_dir
+                index_file = os.path.join(data_dir, f"index_{model_name_clean}.faiss")
         
         print(f"Loading FAISS index from: {index_file}")
         index = faiss.read_index(index_file)
         print(f"✅ Loaded FAISS index with {index.ntotal} vectors")
         
         # Load chunk metadata with preference_ids
-        kept_file = os.path.join(method_dir, "kept.jsonl")
+        # For standard method: use method_dir directly (mydata style)
+        if self.method == "standard":
+            kept_file = os.path.join(method_dir, "kept.jsonl")
+        else:
+            kept_file = os.path.join(method_dir, "kept.jsonl")
+        
         chunk_metadata = []
         
         if os.path.exists(kept_file):

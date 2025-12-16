@@ -12,7 +12,7 @@ from EPIC_stream import StreamSetup, StreamManager
 import multiprocessing
 
 class EPICMain:
-    def __init__(self, mode="all", method="all", device="cuda:0", output_dir="output", dataset="PrefWiki", emb_model_name="facebook/contriever", doc_mode="wiki", vllm_server_url="http://localhost:8008/v1", llm_model_name="meta-llama/Llama-3.1-8B-Instruct", use_local_llm=False, stream_batch_size=2000, stream_num_add=2, stream_num_remove=1):
+    def __init__(self, mode="all", method="all", device="cuda:0", output_dir="output", dataset="PrefWiki", emb_model_name="facebook/contriever", doc_mode="wiki", vllm_server_url="http://localhost:8008/v1", llm_model_name="meta-llama/Llama-3.1-8B-Instruct", use_local_llm=False, stream_batch_size=2000, stream_num_add=2, stream_num_remove=1, stream_seed=None):
         self.mode = mode
         self.method = method
         self.device = device
@@ -28,6 +28,7 @@ class EPICMain:
         self.stream_batch_size = stream_batch_size
         self.stream_num_add = stream_num_add
         self.stream_num_remove = stream_num_remove
+        self.stream_seed = stream_seed
         
         self.utils = EPICUtils(
             mode=mode,
@@ -89,15 +90,27 @@ class EPICMain:
     def run_single_persona(self, persona_index):
         print(f"\n=== Processing persona {persona_index}  ===")
         
-        if self.llm_model_name == "openai/gpt-oss-20b":
-            method_dir = os.path.join(self.utils.output_dir, f"{self.method}_oss/{persona_index}")
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
-        elif self.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
-            method_dir = os.path.join(self.utils.output_dir, f"{self.method}_qwen/{persona_index}")
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+        # For standard method: use common directory (mydata style)
+        if self.method == "standard":
+            if self.llm_model_name == "openai/gpt-oss-20b":
+                method_dir = os.path.join(self.utils.output_dir, f"{self.method}_oss")
+                data_dir = self.utils.data_dir
+            elif self.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+                method_dir = os.path.join(self.utils.output_dir, f"{self.method}_qwen")
+                data_dir = self.utils.data_dir
+            else:
+                method_dir = os.path.join(self.utils.output_dir, f"{self.method}")
+                data_dir = self.utils.data_dir
         else:
-            method_dir = os.path.join(self.utils.output_dir, f"{self.method}/{persona_index}")
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            if self.llm_model_name == "openai/gpt-oss-20b":
+                method_dir = os.path.join(self.utils.output_dir, f"{self.method}_oss/{persona_index}")
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            elif self.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+                method_dir = os.path.join(self.utils.output_dir, f"{self.method}_qwen/{persona_index}")
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            else:
+                method_dir = os.path.join(self.utils.output_dir, f"{self.method}/{persona_index}")
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
 
         print(f"🔍 Data directory: {data_dir}")
         os.makedirs(method_dir, exist_ok=True)
@@ -107,7 +120,11 @@ class EPICMain:
         # 1. Indexing
         if self.mode in ["indexing", "all"]:
             print("\n1. Starting indexing...")
-            faiss_index_path = os.path.join(data_dir, f"index_flat_{self.emb_model_name.replace('/', '_')}.faiss")
+            # For standard method: check index in data_dir (mydata style)
+            if self.method == "standard":
+                faiss_index_path = os.path.join(data_dir, f"index_{self.emb_model_name.replace('/', '_')}.faiss")
+            else:
+                faiss_index_path = os.path.join(data_dir, f"index_{self.emb_model_name.replace('/', '_')}.faiss")
 
             print(f"faiss_index_path: {faiss_index_path}, dataset: {self.utils.dataset_name}")
 
@@ -145,12 +162,16 @@ class EPICMain:
             print(f"   Batch size: {self.stream_batch_size}")
             
             # Create random preference events avoiding checkpoint timings
+            # Use persona_index as part of seed to ensure same persona gets same events
+            # but different personas get different events
             total_docs = len(cached_resources["chunks"])
+            event_seed = self.stream_seed if self.stream_seed is not None else persona_index
             preference_events = self.stream_manager.create_fixed_preference_events(
                 batch_size=self.stream_batch_size,
                 total_docs=total_docs,
                 num_add=self.stream_num_add,
-                num_remove=self.stream_num_remove
+                num_remove=self.stream_num_remove,
+                seed=event_seed
             )
             
             print(f"   Preference events:")
@@ -165,7 +186,8 @@ class EPICMain:
                 method_dir=method_dir,
                 batch_size=self.stream_batch_size,
                 preference_events=preference_events,
-                skip_evaluation=True  # Skip evaluation during checkpoint
+                skip_evaluation=True,  # Skip evaluation during checkpoint
+                stream_seed=event_seed  # Pass seed for preference event handling
             )
             print(f"✅ Stream processing completed. Results saved to stream directory.")
         
@@ -188,6 +210,7 @@ def main():
     parser.add_argument("--stream_batch_size", type=int, default=2000, help="Batch size for stream mode (documents per batch)")
     parser.add_argument("--stream_num_add", type=int, default=2, help="Number of preference add events in stream mode")
     parser.add_argument("--stream_num_remove", type=int, default=1, help="Number of preference remove events in stream mode")
+    parser.add_argument("--stream_seed", type=int, default=None, help="Random seed for stream preference events (same seed = same events across methods)")
     args = parser.parse_args()
 
     # vLLM URL Processing
@@ -222,6 +245,7 @@ def main():
         stream_batch_size=args.stream_batch_size,
         stream_num_add=args.stream_num_add,
         stream_num_remove=args.stream_num_remove,
+        stream_seed=args.stream_seed,
     )
 
     if indices:

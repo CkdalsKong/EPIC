@@ -1,0 +1,73 @@
+{
+  "base_dir": "/workspace/EPIC",
+  "memory_stats": {
+    "prefwiki": {
+      "EPIC_inst": {
+        "average_memory_mb": 0.3619832825242427,
+        "valid_persona_count": 57,
+        "expected_persona_count": 57
+      },
+      "EPIC_inst_qwen": {
+        "average_memory_mb": 0.9480347047772324,
+        "valid_persona_count": 57,
+        "expected_persona_count": 57
+      },
+      "EPIC_inst_oss": {
+        "average_memory_mb": 0.5559882448430646,
+        "valid_persona_count": 57,
+        "expected_persona_count": 57
+      }
+    },
+    "prefeval": {
+      "EPIC_inst": {
+        "average_memory_mb": 0.6125090415017647,
+        "valid_persona_count": 57,
+        "expected_persona_count": 57
+      },
+      "EPIC_inst_qwen": {
+        "average_memory_mb": 1.6842783208478962,
+        "valid_persona_count": 57,
+        "expected_persona_count": 57
+      },
+      "EPIC_inst_oss": {
+        "average_memory_mb": 0.5924494057370905,
+        "valid_persona_count": 57,
+        "expected_persona_count": 57
+      }
+    },
+    "prefeli5": {
+      "EPIC_inst": {
+        "average_memory_mb": 8.690477645560486,
+        "valid_persona_count": 73,
+        "expected_persona_count": 73
+      },
+      "EPIC_inst_qwen": {
+        "average_memory_mb": 14.418723459113133,
+        "valid_persona_count": 73,
+        "expected_persona_count": 73
+      },
+      "EPIC_inst_oss": {
+        "average_memory_mb": 8.353156416383507,
+        "valid_persona_count": 73,
+        "expected_persona_count": 73
+      }
+    },
+    "prefrq": {
+      "EPIC_inst": {
+        "average_memory_mb": 1.684811602698432,
+        "valid_persona_count": 90,
+        "expected_persona_count": 90
+      },
+      "EPIC_inst_qwen": {
+        "average_memory_mb": 2.077592881520589,
+        "valid_persona_count": 90,
+        "expected_persona_count": 90
+      },
+      "EPIC_inst_oss": {
+        "average_memory_mb": 1.6955283376905652,
+        "valid_persona_count": 90,
+        "expected_persona_count": 90
+      }
+    }
+  }
+}

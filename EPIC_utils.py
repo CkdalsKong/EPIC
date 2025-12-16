@@ -465,6 +465,16 @@ class EPICUtils:
         preferences = [tag.text.strip() for tag in soup.find_all("preference")]
         return preferences
 
+    def retrieve_top_k(self, query, index, chunks, top_k=None):
+        """Simple retrieval without preference filtering (mydata style)"""
+        if top_k is None:
+            top_k = self.top_k
+        query_emb = self.embed_query_mp(query)
+        start_retrieval = time.time()
+        D, I = index.search(query_emb.astype(np.float32), top_k)
+        retrieval_time = time.time() - start_retrieval
+        return [chunks[i] for i in I[0]], retrieval_time
+
     def retrieve_top_k_wq_cosine(self, query, preferences, index, chunks, weighted=False):
         top_k = self.top_k
         start_retrieval = time.time()

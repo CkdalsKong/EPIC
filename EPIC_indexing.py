@@ -28,15 +28,27 @@ class EPICIndexing:
 
         print(f"\n=== Starting indexing for persona {persona_index} ===")
 
-        if self.utils.llm_model_name == "openai/gpt-oss-20b":
-            method_dir = os.path.join(self.output_dir, f"{self.method}_oss/{persona_index}")
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
-        elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
-            method_dir = os.path.join(self.output_dir, f"{self.method}_qwen/{persona_index}")
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+        # For standard method: use common directory (no persona subdirectory) - mydata style
+        if self.method == "standard":
+            if self.utils.llm_model_name == "openai/gpt-oss-20b":
+                method_dir = os.path.join(self.output_dir, f"{self.method}_oss")
+                data_dir = self.utils.data_dir
+            elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+                method_dir = os.path.join(self.output_dir, f"{self.method}_qwen")
+                data_dir = self.utils.data_dir
+            else:
+                method_dir = os.path.join(self.output_dir, f"{self.method}")
+                data_dir = self.utils.data_dir
         else:
-            method_dir = os.path.join(self.output_dir, f"{self.method}/{persona_index}")
-            data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            if self.utils.llm_model_name == "openai/gpt-oss-20b":
+                method_dir = os.path.join(self.output_dir, f"{self.method}_oss/{persona_index}")
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+                method_dir = os.path.join(self.output_dir, f"{self.method}_qwen/{persona_index}")
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            else:
+                method_dir = os.path.join(self.output_dir, f"{self.method}/{persona_index}")
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
         
         
         model_name_clean = self.emb_model_name.replace('/', '_')
@@ -123,12 +135,24 @@ class EPICIndexing:
             print(f"\n=== Completed standard indexing for persona {persona_index} ===")
             print(f"Total time: {total_time:.2f} seconds")
             
-            # Generate report
-            fieldnames = ["method", "persona_index", "total_chunks", "total_time(s)"]
+            # Generate report (mydata style: persona_index = "all" for standard)
+            fieldnames = ["method", "persona_index", "cosine_kept", "random_kept", "cluster_kept", "llm_filtered", "rewritten", "kept", "cosine_filter_time(s)", "random_filter_time(s)", "cluster_filter_time(s)", "llm_time(s)", "rewriting_time(s)", "inst_time(s)", "faiss_time(s)", "total_time(s)"]
             row = {
                 "method": f"{self.method}{llm_name}",
-                "persona_index": f"{persona_index}",
-                "total_chunks": len(chunks),
+                "persona_index": "all",
+                "cosine_kept": 0,
+                "random_kept": 0,
+                "cluster_kept": 0,
+                "llm_filtered": 0,
+                "rewritten": 0,
+                "kept": len(chunks),
+                "cosine_filter_time(s)": "0",
+                "random_filter_time(s)": "0",
+                "cluster_filter_time(s)": "0",
+                "llm_time(s)": "0",
+                "rewriting_time(s)": "0",
+                "inst_time(s)": "0",
+                "faiss_time(s)": f"{total_time:.2f}",
                 "total_time(s)": f"{total_time:.2f}"
             }
             self.utils.save_csv(os.path.join(self.output_dir, self.utils.indexing_report_file), fieldnames, row)
@@ -215,9 +239,59 @@ class EPICIndexing:
                 self.utils.save_jsonl(cosine_filtering_file, kept_save)
                 print(f"✅ Cosine filtering results saved to {cosine_filtering_file}")
             
-            # For cosine method: exit after saving JSONL (no CSV report, no LLM filtering, no FAISS indexing)
+            # For cosine method: continue to create FAISS index (mydata style)
+            print("\nCreating FAISS index for cosine method...")
+            start_faiss = time.time()
+            
+            # Generate embeddings for kept chunks
+            chunk_to_idx = {chunk: idx for idx, chunk in enumerate(chunks)}
+            selected_indices = [chunk_to_idx[chunk] for chunk in kept_chunks]
+            embeddings = chunk_embeddings[selected_indices]
+            embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+            
+            # Create FAISS index
+            dim = embeddings.shape[1]
+            print(f"Creating FAISS IndexFlatIP (dim={dim})...")
+            index = faiss.IndexFlatIP(dim)
+            index.add(embeddings.astype(np.float32))
+            
+            # Save FAISS index and embeddings
+            faiss.write_index(index, index_file)
+            print(f"✅ FAISS index saved to {index_file}")
+            np.save(embeddings_file, embeddings)
+            print(f"✅ Embeddings saved to {embeddings_file}")
+            
+            # Save kept chunks
+            kept_file = os.path.join(method_dir, "kept.jsonl")
+            self.utils.save_jsonl(kept_file, [{"text": chunk} for chunk in kept_chunks])
+            print(f"✅ Kept chunks saved to {kept_file}")
+            
+            faiss_time = time.time() - start_faiss
             total_time = time.time() - start_total
-            print(f"\n=== Completed cosine filtering for persona {persona_index} ===")
+            
+            # Generate report (mydata style)
+            fieldnames = ["method", "persona_index", "cosine_kept", "random_kept", "cluster_kept", "llm_filtered", "rewritten", "kept", "cosine_filter_time(s)", "random_filter_time(s)", "cluster_filter_time(s)", "llm_time(s)", "rewriting_time(s)", "inst_time(s)", "faiss_time(s)", "total_time(s)"]
+            row = {
+                "method": f"{self.method}{llm_name}",
+                "persona_index": f"{persona_index}",
+                "cosine_kept": len(kept_chunks),
+                "random_kept": 0,
+                "cluster_kept": 0,
+                "llm_filtered": 0,
+                "rewritten": 0,
+                "kept": len(kept_chunks),
+                "cosine_filter_time(s)": f"{filter_time:.2f}",
+                "random_filter_time(s)": "0",
+                "cluster_filter_time(s)": "0",
+                "llm_time(s)": "0",
+                "rewriting_time(s)": "0",
+                "inst_time(s)": "0",
+                "faiss_time(s)": f"{faiss_time:.2f}",
+                "total_time(s)": f"{total_time:.2f}"
+            }
+            self.utils.save_csv(os.path.join(self.output_dir, self.utils.indexing_report_file), fieldnames, row)
+            
+            print(f"\n=== Completed cosine indexing for persona {persona_index} ===")
             print(f"Total time: {total_time:.2f} seconds")
             return method_dir
       
