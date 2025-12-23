@@ -90,26 +90,25 @@ class EPICMain:
     def run_single_persona(self, persona_index):
         print(f"\n=== Processing persona {persona_index}  ===")
         
-        # For standard method: use common directory (mydata style)
-        if self.method == "standard":
-            if self.llm_model_name == "openai/gpt-oss-20b":
-                method_dir = os.path.join(self.utils.output_dir, f"{self.method}_oss")
-                data_dir = self.utils.data_dir
-            elif self.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
-                method_dir = os.path.join(self.utils.output_dir, f"{self.method}_qwen")
-                data_dir = self.utils.data_dir
+        # Output directory: all methods use persona-specific directories
+        # Indexing directory (data_dir): standard uses common, others use persona-specific
+        if self.llm_model_name == "openai/gpt-oss-20b":
+            method_dir = os.path.join(self.utils.output_dir, f"{self.method}_oss/{persona_index}")
+            if self.method == "standard":
+                data_dir = self.utils.data_dir  # Common directory for standard
             else:
-                method_dir = os.path.join(self.utils.output_dir, f"{self.method}")
-                data_dir = self.utils.data_dir
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+        elif self.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+            method_dir = os.path.join(self.utils.output_dir, f"{self.method}_qwen/{persona_index}")
+            if self.method == "standard":
+                data_dir = self.utils.data_dir  # Common directory for standard
+            else:
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
         else:
-            if self.llm_model_name == "openai/gpt-oss-20b":
-                method_dir = os.path.join(self.utils.output_dir, f"{self.method}_oss/{persona_index}")
-                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
-            elif self.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
-                method_dir = os.path.join(self.utils.output_dir, f"{self.method}_qwen/{persona_index}")
-                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            method_dir = os.path.join(self.utils.output_dir, f"{self.method}/{persona_index}")
+            if self.method == "standard":
+                data_dir = self.utils.data_dir  # Common directory for standard
             else:
-                method_dir = os.path.join(self.utils.output_dir, f"{self.method}/{persona_index}")
                 data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
 
         print(f"🔍 Data directory: {data_dir}")
@@ -186,7 +185,7 @@ class EPICMain:
                 method_dir=method_dir,
                 batch_size=self.stream_batch_size,
                 preference_events=preference_events,
-                skip_evaluation=True,  # Skip evaluation during checkpoint
+                skip_evaluation=False,  # Skip evaluation during checkpoint
                 stream_seed=event_seed  # Pass seed for preference event handling
             )
             print(f"✅ Stream processing completed. Results saved to stream directory.")

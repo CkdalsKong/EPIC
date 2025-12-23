@@ -148,9 +148,9 @@ class EPICGeneration:
     def run_generation_with_cache(self, persona_index, method_dir, cached_resources):
         print(f"\n=== Starting generation for persona {persona_index} ===")
 
-        # For standard method: use common directory (mydata style)
+        # Indexing directory (data_dir): standard uses common, others use persona-specific
         if self.method == "standard":
-            data_dir = self.utils.data_dir
+            data_dir = self.utils.data_dir  # Common directory for standard
         else:
             if self.utils.dataset_name == "PrefWiki":
                 data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
@@ -159,6 +159,8 @@ class EPICGeneration:
             elif self.utils.dataset_name == "PrefRQ":
                 data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
             elif self.utils.dataset_name == "PrefEval":
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            else:
                 data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
             
         # Determine index file path based on index type
@@ -171,25 +173,17 @@ class EPICGeneration:
         preference_list = [block["preference"] for block in persona["preference_blocks"]]
 
         # Load unified FAISS index and metadata (same approach for all methods)
-        # For standard method: use data_dir directly (mydata style)
-        if self.method == "standard":
+        index_file = os.path.join(method_dir, f"index_{model_name_clean}.faiss")
+        if not os.path.exists(index_file):
+            # Fallback to data_dir if not in method_dir
             index_file = os.path.join(data_dir, f"index_{model_name_clean}.faiss")
-        else:
-            index_file = os.path.join(method_dir, f"index_{model_name_clean}.faiss")
-            if not os.path.exists(index_file):
-                # Fallback to data_dir if not in method_dir
-                index_file = os.path.join(data_dir, f"index_{model_name_clean}.faiss")
         
         print(f"Loading FAISS index from: {index_file}")
         index = faiss.read_index(index_file)
         print(f"✅ Loaded FAISS index with {index.ntotal} vectors")
         
-        # Load chunk metadata with preference_ids
-        # For standard method: use method_dir directly (mydata style)
-        if self.method == "standard":
-            kept_file = os.path.join(method_dir, "kept.jsonl")
-        else:
-            kept_file = os.path.join(method_dir, "kept.jsonl")
+        # Load chunk metadata
+        kept_file = os.path.join(method_dir, "kept.jsonl")
         
         chunk_metadata = []
         

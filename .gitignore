@@ -12,3 +12,6 @@ run_stream_jetson.sh
 Dockerfile
 docker_init.sh
 run_docker.sh
+
+*.pem
+*.zip

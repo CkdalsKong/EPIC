@@ -28,26 +28,25 @@ class EPICIndexing:
 
         print(f"\n=== Starting indexing for persona {persona_index} ===")
 
-        # For standard method: use common directory (no persona subdirectory) - mydata style
-        if self.method == "standard":
-            if self.utils.llm_model_name == "openai/gpt-oss-20b":
-                method_dir = os.path.join(self.output_dir, f"{self.method}_oss")
-                data_dir = self.utils.data_dir
-            elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
-                method_dir = os.path.join(self.output_dir, f"{self.method}_qwen")
-                data_dir = self.utils.data_dir
+        # Output directory: all methods use persona-specific directories
+        # Indexing directory (data_dir): standard uses common, others use persona-specific
+        if self.utils.llm_model_name == "openai/gpt-oss-20b":
+            method_dir = os.path.join(self.output_dir, f"{self.method}_oss/{persona_index}")
+            if self.method == "standard":
+                data_dir = self.utils.data_dir  # Common directory for standard
             else:
-                method_dir = os.path.join(self.output_dir, f"{self.method}")
-                data_dir = self.utils.data_dir
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+        elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+            method_dir = os.path.join(self.output_dir, f"{self.method}_qwen/{persona_index}")
+            if self.method == "standard":
+                data_dir = self.utils.data_dir  # Common directory for standard
+            else:
+                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
         else:
-            if self.utils.llm_model_name == "openai/gpt-oss-20b":
-                method_dir = os.path.join(self.output_dir, f"{self.method}_oss/{persona_index}")
-                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
-            elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
-                method_dir = os.path.join(self.output_dir, f"{self.method}_qwen/{persona_index}")
-                data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
+            method_dir = os.path.join(self.output_dir, f"{self.method}/{persona_index}")
+            if self.method == "standard":
+                data_dir = self.utils.data_dir  # Common directory for standard
             else:
-                method_dir = os.path.join(self.output_dir, f"{self.method}/{persona_index}")
                 data_dir = os.path.join(self.utils.data_dir, f"{persona_index}")
         
         
@@ -64,48 +63,15 @@ class EPICIndexing:
         chunk_embeddings = cached_resources["embeddings"]
         print(f"Using {len(chunks)} cached chunks and their embeddings")
 
-        persona = self.utils.load_persona_data(persona_index)
-        print(f"Loaded persona data for index {persona_index}")
-
-        print("Loading or generating preference embeddings...")
-        preference_list = [block["preference"] for block in persona["preference_blocks"]]
-        preference_emb_file_prefix = "nv_" if self.emb_model_name == "nvidia/NV-Embed-v2" else ""
-        if self.utils.dataset_name == "PrefWiki":
-            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_prefwiki_mp.npy")
-        elif self.utils.dataset_name == "PrefELI5":
-            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_prefeli5_mp.npy")
-        elif self.utils.dataset_name == "PrefRQ":
-            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_rq_mp.npy")
-        elif self.utils.dataset_name == "PrefEval":
-            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_prefeval_mp.npy")
-
-
-        if os.path.exists(preference_emb_file):
-            print("Loading existing preference embeddings...")
-            preference_embeddings = np.load(preference_emb_file)
-        else:
-            print("Generating new preference embeddings...")
-            preference_embeddings = self.utils.embed_texts_mp(preference_list)\
-            
-            preference_embeddings = preference_embeddings / np.linalg.norm(preference_embeddings, axis=1, keepdims=True)
-            np.save(preference_emb_file, preference_embeddings)
-            print(f"Saved preference embeddings to {preference_emb_file}")
-            
-            
-        chunk_embeddings_norm = chunk_embeddings / np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)
-        print(f"Using {len(preference_list)} preference embeddings")
-        
         start_total = time.time()
-
-        print(self.utils.threshold)
         
-        # For standard method: save all chunks without filtering
+        # For standard method: save all chunks without filtering (no preference needed)
         if self.method == "standard":
             print("\n=== Standard method: Saving all chunks without filtering ===")
             print(f"Total chunks: {len(chunks)}")
             
-            # Generate embeddings for all chunks
-            print("Generating embeddings for all chunks...")
+            # Normalize chunk embeddings
+            chunk_embeddings_norm = chunk_embeddings / np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)
             embeddings = chunk_embeddings_norm.copy()
             
             # Create FAISS index
@@ -158,6 +124,37 @@ class EPICIndexing:
             self.utils.save_csv(os.path.join(self.output_dir, self.utils.indexing_report_file), fieldnames, row)
             
             return method_dir
+        
+        # Load persona and preference embeddings only for non-standard methods
+        persona = self.utils.load_persona_data(persona_index)
+        print(f"Loaded persona data for index {persona_index}")
+
+        print("Loading or generating preference embeddings...")
+        preference_list = [block["preference"] for block in persona["preference_blocks"]]
+        preference_emb_file_prefix = "nv_" if self.emb_model_name == "nvidia/NV-Embed-v2" else ""
+        if self.utils.dataset_name == "PrefWiki":
+            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_prefwiki_mp.npy")
+        elif self.utils.dataset_name == "PrefELI5":
+            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_prefeli5_mp.npy")
+        elif self.utils.dataset_name == "PrefRQ":
+            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_rq_mp.npy")
+        elif self.utils.dataset_name == "PrefEval":
+            preference_emb_file = os.path.join(self.utils.root_dir, f"indexing/{preference_emb_file_prefix}preference_embeddings_{persona_index}_prefeval_mp.npy")
+
+        if os.path.exists(preference_emb_file):
+            print("Loading existing preference embeddings...")
+            preference_embeddings = np.load(preference_emb_file)
+        else:
+            print("Generating new preference embeddings...")
+            preference_embeddings = self.utils.embed_texts_mp(preference_list)
+            preference_embeddings = preference_embeddings / np.linalg.norm(preference_embeddings, axis=1, keepdims=True)
+            np.save(preference_emb_file, preference_embeddings)
+            print(f"Saved preference embeddings to {preference_emb_file}")
+            
+        chunk_embeddings_norm = chunk_embeddings / np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)
+        print(f"Using {len(preference_list)} preference embeddings")
+        
+        print(self.utils.threshold)
         
         print("\nStarting cosine similarity filtering...")
         kept_save, kept_chunks, filtered_save = [], [], []

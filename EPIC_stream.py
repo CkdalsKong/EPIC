@@ -2,11 +2,9 @@ import os
 import json
 import time
 import faiss
-import torch
 import numpy as np
 import random
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 try:
@@ -37,7 +35,7 @@ class StreamSetup:
         self.stream_seed = stream_seed  # Seed for preference events (for reproducibility)
         
         # Stream state - using metadata-based management
-        self.chunk_metadata = []  # [{id, text, insight, relevant_preferences, active}]
+        self.chunk_metadata = []  # [{id, text, instruction, relevant_preferences, active}]
         self.next_chunk_id = 0
         self.faiss_index = None  # Single FAISS index with IDMap
         self.embedding_dim = None
@@ -82,7 +80,7 @@ class StreamSetup:
         self.chunk_metadata = []
         self.next_chunk_id = 0
         self.checkpoint_results = []
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        if self.method == "EPIC_inst":
             self.preference_to_chunks = {pref: set() for pref in self.active_preferences}
         else:
             # For standard and cosine: no preference_to_chunks mapping needed
@@ -132,13 +130,9 @@ class StreamSetup:
             tuple: (keep: bool, filtered_preferences: list, reason: str)
         """
         try:
-            # Load filtering prompts based on method
-            if self.method == "EPIC_insight":
-                system_prompt = self.utils.load_prompt_template(self.utils.filtering_system)
-                user_prompt = self.utils.load_prompt_template(self.utils.filtering_user)
-            else:  # EPIC_inst
-                system_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_system)
-                user_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_user)
+            # Load filtering prompts for EPIC_inst
+            system_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_system)
+            user_prompt = self.utils.load_prompt_template(self.utils.filtering_inst_user)
             
             # Use utils.process_chunk_rand_prefs
             result = self.utils.process_chunk_rand_prefs(
@@ -156,13 +150,6 @@ class StreamSetup:
             decision = result.get("decision", "Filter")
             reason = result.get("reason", "")
             preferences = result.get("relevant_preference", [])
-            
-            # Map Rewrite to Keep (for insight methods)
-            if self.method == "EPIC_insight":
-                if decision == "Rewrite":
-                    decision = "Keep"
-                elif decision == "Filter":
-                    decision = "Discard"
             
             keep = decision == "Keep"
             return keep, preferences if preferences else [], reason
@@ -188,8 +175,8 @@ class StreamSetup:
         if preference_text in self.inactive_preferences:
             self.inactive_preferences.remove(preference_text)
             
-            # Reactivate chunks that belong to this preference (only for EPIC methods)
-            if self.method in ["EPIC_insight", "EPIC_inst"]:
+            # Reactivate chunks that belong to this preference (only for EPIC_inst)
+            if self.method == "EPIC_inst":
                 if preference_text in self.preference_to_chunks:
                     chunk_ids = self.preference_to_chunks[preference_text]
                     for chunk_id in chunk_ids:
@@ -205,13 +192,13 @@ class StreamSetup:
         if self.method != "standard":
             self._compute_preference_embeddings()
         
-        # Initialize preference_to_chunks if new preference (only for EPIC methods)
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        # Initialize preference_to_chunks if new preference (only for EPIC_inst)
+        if self.method == "EPIC_inst":
             if preference_text not in self.preference_to_chunks:
                 self.preference_to_chunks[preference_text] = set()
         
         # Update active chunks count
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        if self.method == "EPIC_inst":
             active_count = sum(1 for m in self.chunk_metadata if m.get("active", True))
         else:
             # For standard and cosine: all chunks (no active concept)
@@ -254,9 +241,9 @@ class StreamSetup:
         if self.method != "standard":
             self._compute_preference_embeddings()
         
-        # Deactivate chunks that ONLY belong to this preference (only for EPIC methods)
+        # Deactivate chunks that ONLY belong to this preference (only for EPIC_inst)
         deactivated_count = 0
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        if self.method == "EPIC_inst":
             if preference_text in self.preference_to_chunks:
                 chunk_ids = self.preference_to_chunks[preference_text]
                 for chunk_id in chunk_ids:
@@ -266,15 +253,14 @@ class StreamSetup:
                         other_active_prefs = [p for p in meta["relevant_preferences"] 
                                              if p in self.active_preferences and p != preference_text]
                         if not other_active_prefs:
-                            # No other active preferences, deactivate this chunk (only for EPIC methods)
-                            if self.method in ["EPIC_insight", "EPIC_inst"]:
-                                meta["active"] = False
-                                meta["deactivated_at_docs"] = self.stream_meta["total_docs_processed"]
-                                meta["deactivated_reason"] = f"Preference removed: {preference_text[:50]}..."
-                                deactivated_count += 1
+                            # No other active preferences, deactivate this chunk
+                            meta["active"] = False
+                            meta["deactivated_at_docs"] = self.stream_meta["total_docs_processed"]
+                            meta["deactivated_reason"] = f"Preference removed: {preference_text[:50]}..."
+                            deactivated_count += 1
         
         # Update active chunks count
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        if self.method == "EPIC_inst":
             active_count = sum(1 for m in self.chunk_metadata if m.get("active", True))
         else:
             # For standard and cosine: all chunks (no active concept)
@@ -347,77 +333,9 @@ class StreamSetup:
         selected_preference = random.choice(available_prefs)
         return selected_preference, source_persona_index
     
-    def _add_chunks_to_index(self, chunks, embeddings, preferences_list, insights=None, instructions=None):
-        """
-        Incrementally add chunks to FAISS index with metadata
-        
-        Args:
-            chunks: List of chunk texts
-            embeddings: List of embedding vectors
-            preferences_list: List of relevant preferences for each chunk
-            insights: Optional list of insights for each chunk (for EPIC_insight)
-            instructions: Optional list of instructions for each chunk (for EPIC_inst)
-        """
-        if not chunks:
-            return
-        
-        # Prepare IDs and embeddings for FAISS
-        start_id = self.next_chunk_id
-        ids = np.arange(start_id, start_id + len(chunks), dtype=np.int64)
-        emb_array = np.array(embeddings).astype(np.float32)
-        
-        # Add to FAISS index
-        self.faiss_index.add_with_ids(emb_array, ids)
-        
-        # Add metadata for each chunk
-        for i, (chunk, prefs, emb) in enumerate(zip(chunks, preferences_list, embeddings)):
-            chunk_id = start_id + i
-            insight = insights[i] if insights and i < len(insights) else None
-            instruction = instructions[i] if instructions and i < len(instructions) else None
-            
-            metadata = {
-                "id": chunk_id,
-                "text": chunk,  # "text" to match indexing
-                "relevant_preferences": prefs,  # "relevant_preferences" to match indexing
-                "active": True,
-                "added_at_docs": self.stream_meta["total_docs_processed"],
-                "embedding": emb  # Store embedding for saving to data/indexing
-            }
-            
-            # Add method-specific fields
-            if insight:
-                metadata["insight"] = insight
-            if instruction:
-                metadata["instruction"] = instruction
-            
-            self.chunk_metadata.append(metadata)
-            
-            # Update preference_to_chunks mapping (only for EPIC methods)
-            if self.method in ["EPIC_insight", "EPIC_inst"]:
-                for pref in prefs:
-                    if pref not in self.preference_to_chunks:
-                        self.preference_to_chunks[pref] = set()
-                    self.preference_to_chunks[pref].add(chunk_id)
-        
-        self.next_chunk_id += len(chunks)
-        self.stream_meta["total_chunks_indexed"] = len(self.chunk_metadata)
-    
-    def get_index(self):
-        """Get the current FAISS index (no rebuild needed with incremental updates)"""
-        if self.faiss_index is None or self.faiss_index.ntotal == 0:
-            print("⚠️ No embeddings in index")
-            return None
-        
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
-            active_count = sum(1 for m in self.chunk_metadata if m.get("active", True))
-        else:
-            active_count = len(self.chunk_metadata)
-        print(f"✅ Using FAISS index with {self.faiss_index.ntotal} vectors ({active_count} active)")
-        return self.faiss_index
-    
     def search_active_chunks(self, query_emb, top_k=5):
         """
-        Search FAISS index and return only active chunks (for EPIC methods only)
+        Search FAISS index and return only active chunks (for EPIC_inst only)
         
         Args:
             query_emb: Query embedding vector
@@ -437,8 +355,8 @@ class StreamSetup:
         for idx in I[0]:
             if idx >= 0 and idx < len(self.chunk_metadata):
                 meta = self.chunk_metadata[idx]
-                # Only filter by active for EPIC methods
-                if self.method in ["EPIC_insight", "EPIC_inst"]:
+                # Only filter by active for EPIC_inst
+                if self.method == "EPIC_inst":
                     if meta.get("active", True):
                         results.append(meta["text"])
                         if len(results) >= top_k:
@@ -452,8 +370,8 @@ class StreamSetup:
         return results
     
     def get_active_chunks(self):
-        """Get list of all active chunks (for EPIC methods) or all chunks (for standard/cosine)"""
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        """Get list of all active chunks (for EPIC_inst) or all chunks (for standard/cosine)"""
+        if self.method == "EPIC_inst":
             return [m["text"] for m in self.chunk_metadata if m.get("active", True)]
         else:
             # For standard and cosine: return all chunks (no active filtering)
@@ -473,27 +391,25 @@ class StreamSetup:
         print(f"\n🔍 Running checkpoint evaluation #{checkpoint_id}...")
         
         # Get existing FAISS index (no rebuild needed)
-        index = self.get_index()
-        if index is None:
+        if self.faiss_index is None or self.faiss_index.ntotal == 0:
+            print("⚠️ No embeddings in index")
             return None
         
         # Save current chunks for generation
         checkpoint_dir = os.path.join(method_dir, f"checkpoint_{checkpoint_id}")
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # Save chunks (with insights/instructions if available)
+        # Save chunks (with instructions if available)
         # For standard and cosine: save all chunks
-        # For EPIC methods: save only active chunks
+        # For EPIC_inst: save only active chunks
         kept_file = os.path.join(checkpoint_dir, "kept.jsonl")
         active_chunks = []
         with open(kept_file, 'w', encoding='utf-8') as f:
             for meta in self.chunk_metadata:
                 # For standard and cosine: save all chunks (no active filtering)
-                # For EPIC methods: save only active chunks
+                # For EPIC_inst: save only active chunks
                 if self.method in ["standard", "cosine"] or meta.get("active", True):
                     item = {"text": meta["text"], "id": meta["id"]}
-                    if meta.get("insight"):
-                        item["insight"] = meta["insight"]
                     if meta.get("instruction"):
                         item["instruction"] = meta["instruction"]
                     item["relevant_preferences"] = meta["relevant_preferences"]
@@ -502,8 +418,8 @@ class StreamSetup:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
                     active_chunks.append(meta["text"])
         
-        # Run generation for a subset of queries
-        generation_results = self._run_generation(index, checkpoint_dir, active_chunks)
+        # Run generation for all queries
+        generation_results = self._run_generation(checkpoint_dir, active_chunks)
         
         # Run evaluation on generated results (skip if flag is set)
         if self.skip_evaluation:
@@ -515,7 +431,7 @@ class StreamSetup:
         # Calculate metrics
         total = len(generation_results) if generation_results else 1
         # For standard and cosine: all indexed chunks are "active"
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        if self.method == "EPIC_inst":
             active_count = len(active_chunks)
         else:
             active_count = len(self.chunk_metadata)
@@ -568,7 +484,7 @@ class StreamSetup:
         
         return metrics
     
-    def _run_generation(self, index, checkpoint_dir, active_chunks=None):
+    def _run_generation(self, checkpoint_dir, active_chunks=None):
         """Run generation for current checkpoint"""
         generation_prompt = self.utils.load_prompt_template(self.utils.generation_prompt)
         all_results = []
@@ -591,7 +507,7 @@ class StreamSetup:
             if preference_text not in self.active_preferences:
                 continue
             
-            queries = block["queries"][:3]  # Limit queries per checkpoint for speed
+            queries = block["queries"]  # Use all queries
             
             for query in queries:
                 question = query["question"]
@@ -600,26 +516,48 @@ class StreamSetup:
                     start_retrieval = time.time()
                     
                     # Use active-aware retrieval
-                    retrieved = self._retrieve_active_chunks(question, self.utils.top_k)
+                    retrieved_data = self._retrieve_active_chunks(question, self.utils.top_k)
                     retrieval_time = time.time() - start_retrieval
+                    
+                    # Handle different return types
+                    if isinstance(retrieved_data, dict):
+                        # EPIC_inst returns dict with 'texts' and 'instructions'
+                        retrieved = retrieved_data.get("texts", [])
+                        retrieved_instructions = retrieved_data.get("instructions", [])
+                    else:
+                        # Standard/cosine returns list of texts
+                        retrieved = retrieved_data if retrieved_data else []
+                        retrieved_instructions = []
                     
                     if not retrieved:
                         # Fallback to standard retrieval if no results (using utils functions)
                         if self.method in ["standard", "cosine"]:
                             retrieved, retrieval_time = self.utils.retrieve_top_k(
                                 question,
-                                index,
+                                self.faiss_index,
                                 active_chunks
                             )
+                            retrieved_instructions = []
                         else:
                             retrieved, retrieval_time = self.utils.retrieve_top_k_wq_cosine(
                                 question,
                                 self.active_preferences,
-                                index,
+                                self.faiss_index,
                                 active_chunks
                             )
+                            retrieved_instructions = []
                     
-                    context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved)])
+                    # Build context with instructions if available (same as EPIC_generation.py)
+                    if self.method == "EPIC_inst" and retrieved_instructions:
+                        context_parts = []
+                        for i, (doc, inst) in enumerate(zip(retrieved, retrieved_instructions)):
+                            if inst:
+                                context_parts.append(f"Document {i+1}:\nInterpretation Guidance: {inst}\nContent: {doc}")
+                            else:
+                                context_parts.append(f"Document {i+1}: {doc}")
+                        context = "\n\n".join(context_parts)
+                    else:
+                        context = "\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved)])
                     filled_prompt = generation_prompt.replace("{context}", context).replace("{question}", question)
                     
                     generated_text = self.utils.generate_message_vllm(
@@ -682,15 +620,41 @@ class StreamSetup:
             )
             return retrieved
         
-        # For EPIC methods: add preference weighting
-        if self.preference_embeddings is not None and len(self.active_preferences) > 0:
-            pref_sims = np.dot(self.preference_embeddings, query_emb.T).squeeze()
-            max_pref_idx = np.argmax(pref_sims)
-            pref_emb = self.utils.embed_query_mp(self.active_preferences[max_pref_idx])
-            query_emb = query_emb + pref_sims[max_pref_idx] * pref_emb
-            query_emb = query_emb / np.linalg.norm(query_emb, axis=1, keepdims=True)
+        # For EPIC_inst: add preference weighting and filter by top preference (same as EPIC_generation.py)
+        if self.method == "EPIC_inst":
+            if self.preference_embeddings is not None and len(self.active_preferences) > 0:
+                # Find top-1 preference for this query (same as EPIC_generation.py)
+                pref_sims = np.dot(self.preference_embeddings, query_emb.T).squeeze()
+                max_pref_idx = np.argmax(pref_sims)
+                top_pref_text = self.active_preferences[max_pref_idx]
+                
+                # Augment query with preference (same as EPIC_generation.py - not weighted)
+                pref_emb = self.utils.embed_query_mp(top_pref_text)
+                query_emb = query_emb + pref_emb
+                query_emb = query_emb / np.linalg.norm(query_emb, axis=1, keepdims=True)
+                
+                # Search with larger k to allow for filtering (same as EPIC_generation.py)
+                search_k = min(top_k * 5, self.faiss_index.ntotal)
+                D, I = self.faiss_index.search(query_emb.astype(np.float32), search_k)
+                
+                # Filter by top_pref_text in relevant_preferences and active status (same as EPIC_generation.py)
+                retrieved = []
+                retrieved_instructions = []
+                chunk_id_to_meta = {meta["id"]: meta for meta in self.chunk_metadata}
+                for chunk_id in I[0]:
+                    if chunk_id in chunk_id_to_meta:
+                        meta = chunk_id_to_meta[chunk_id]
+                        # Check if chunk is active and relevant to top preference
+                        # Use relevant_preferences (stream mode) instead of preference_ids (generation mode)
+                        if meta.get("active", True) and top_pref_text in meta.get("relevant_preferences", []):
+                            retrieved.append(meta["text"])
+                            retrieved_instructions.append(meta.get("instruction", ""))
+                            if len(retrieved) >= top_k:
+                                break
+                
+                return {"texts": retrieved, "instructions": retrieved_instructions}
         
-        # Search and filter by active status (for EPIC methods)
+        # Fallback for other EPIC methods (should not reach here for supported methods)
         return self.search_active_chunks(query_emb, top_k)
     
     def _run_evaluation(self, generation_data, checkpoint_dir):
@@ -807,7 +771,7 @@ class StreamSetup:
         
         # Save chunk metadata summary
         chunk_summary_file = os.path.join(checkpoint_dir, "chunk_summary.json")
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        if self.method == "EPIC_inst":
             active_count = sum(1 for m in self.chunk_metadata if m.get("active", True))
             inactive_count = len(self.chunk_metadata) - active_count
         else:
@@ -1080,8 +1044,8 @@ class StreamSetup:
             
         Flow:
             1. Cosine filtering - check if chunk is similar to any active preference
-            2. LLM filtering - ask LLM to decide Keep/Discard
-            3. If Keep -> Insight generation (for insight methods)
+            2. LLM filtering - ask LLM to decide Keep/Discard (for EPIC_inst)
+            3. If Keep -> Instruction generation (for EPIC_inst)
             4. Add to FAISS index
         """
         process_start_time = time.time()
@@ -1101,7 +1065,7 @@ class StreamSetup:
         if self.method == "standard":
             processing_time = time.time() - process_start_time
             # Save all chunks with empty preferences (no preference filtering)
-            self._add_single_chunk_to_index(chunk, emb_norm, [], None, None, processing_time)
+            self._add_single_chunk_to_index(chunk, emb_norm, [], processing_time=processing_time)
             return
         
         # ============================================
@@ -1128,7 +1092,7 @@ class StreamSetup:
         if self.method == "cosine":
             if cosine_passed:
                 processing_time = time.time() - process_start_time
-                self._add_single_chunk_to_index(chunk, emb_norm, cosine_relevant_prefs, None, None, processing_time)
+                self._add_single_chunk_to_index(chunk, emb_norm, cosine_relevant_prefs, processing_time=processing_time)
             return
         
         # If cosine filtering failed, skip this document
@@ -1138,8 +1102,8 @@ class StreamSetup:
         # ============================================
         # Step 2: LLM Filtering (Keep/Discard)
         # ============================================
-        # For methods that need LLM filtering
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        # For EPIC_inst: need LLM filtering
+        if self.method == "EPIC_inst":
             llm_keep, llm_prefs, reason = self._llm_filter_chunk(chunk, cosine_relevant_prefs)
             
             if not llm_keep:
@@ -1147,35 +1111,19 @@ class StreamSetup:
             
             final_prefs = llm_prefs if llm_prefs else cosine_relevant_prefs
             
-            # Generate insight or instruction using utils functions
-            if self.method == "EPIC_insight":
-                # Use utils.insight_single
-                entry = {
-                    "chunk": chunk,
-                    "relevant_preference": final_prefs,
-                    "reason": reason if reason else "Matched by LLM filtering"
-                }
-                insight_prompt_user = self.utils.load_prompt_template(self.utils.insight_user)
-                insight_prompt_system = self.utils.load_prompt_template(self.utils.insight_system)
-                insight_result = self.utils.insight_single(entry, insight_prompt_user, insight_prompt_system)
-                insight = insight_result.get("insight", "")
-                instruction = None
-            else:  # EPIC_inst
-                # Use utils.inst_single
-                entry = {
-                    "chunk": chunk,
-                    "relevant_preference": final_prefs,
-                    "reason": reason if reason else "Matched by LLM filtering"
-                }
-                inst_prompt_user = self.utils.load_prompt_template(self.utils.inst_user)
-                inst_prompt_system = self.utils.load_prompt_template(self.utils.inst_system)
-                inst_result = self.utils.inst_single(entry, inst_prompt_user, inst_prompt_system)
-                instruction = inst_result.get("instruction", "")
-                insight = None
+            # Generate instruction using utils functions
+            entry = {
+                "chunk": chunk,
+                "relevant_preference": final_prefs,
+                "reason": reason if reason else "Matched by LLM filtering"
+            }
+            inst_prompt_user = self.utils.load_prompt_template(self.utils.inst_user)
+            inst_prompt_system = self.utils.load_prompt_template(self.utils.inst_system)
+            inst_result = self.utils.inst_single(entry, inst_prompt_user, inst_prompt_system)
+            instruction = inst_result.get("instruction", "")
         else:
-            # For cosine-only method, no LLM filtering
+            # For cosine method, no LLM filtering
             final_prefs = cosine_relevant_prefs
-            insight = None
             instruction = None
         
         # ============================================
@@ -1183,21 +1131,16 @@ class StreamSetup:
         # ============================================
         processing_time = time.time() - process_start_time
         
-        # For insight methods: use insight embedding for FAISS
-        if self.method == "EPIC_insight" and insight:
-            insight_emb = self.utils.embed_query_mp(insight)
-            insight_emb = insight_emb / np.linalg.norm(insight_emb, axis=1, keepdims=True)
-            self._add_single_chunk_to_index(chunk, insight_emb.squeeze(0), final_prefs, insight, instruction, processing_time)
-        elif self.method == "EPIC_inst" and instruction:
-            # For inst methods: use instruction embedding for FAISS
+        if self.method == "EPIC_inst" and instruction:
+            # For EPIC_inst: use instruction embedding for FAISS
             instruction_emb = self.utils.embed_query_mp(instruction)
             instruction_emb = instruction_emb / np.linalg.norm(instruction_emb, axis=1, keepdims=True)
-            self._add_single_chunk_to_index(chunk, instruction_emb.squeeze(0), final_prefs, insight, instruction, processing_time)
+            self._add_single_chunk_to_index(chunk, instruction_emb.squeeze(0), final_prefs, instruction, processing_time)
         else:
             # For other methods: use chunk embedding
-            self._add_single_chunk_to_index(chunk, emb_norm, final_prefs, insight, instruction, processing_time)
+            self._add_single_chunk_to_index(chunk, emb_norm, final_prefs, None, processing_time)
     
-    def _add_single_chunk_to_index(self, chunk, embedding, preferences, insight=None, instruction=None, processing_time=None):
+    def _add_single_chunk_to_index(self, chunk, embedding, preferences, instruction=None, processing_time=None):
         """
         Add a single chunk to the FAISS index
         
@@ -1205,7 +1148,6 @@ class StreamSetup:
             chunk: Chunk text
             embedding: Normalized embedding vector
             preferences: List of relevant preferences
-            insight: Optional insight text (for EPIC_insight)
             instruction: Optional instruction text (for EPIC_inst)
             processing_time: Time taken to process this chunk (in seconds)
         """
@@ -1225,13 +1167,11 @@ class StreamSetup:
             "embedding": embedding  # Store embedding for saving to data/indexing
         }
         
-        # Only add "active" field for EPIC methods (standard and cosine don't use active filtering)
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        # Only add "active" field for EPIC_inst (standard and cosine don't use active filtering)
+        if self.method == "EPIC_inst":
             metadata["active"] = True
         
         # Add method-specific fields
-        if insight:
-            metadata["insight"] = insight
         if instruction:
             metadata["instruction"] = instruction
         if processing_time is not None:
@@ -1239,8 +1179,8 @@ class StreamSetup:
         
         self.chunk_metadata.append(metadata)
         
-        # Update preference_to_chunks mapping (only for EPIC methods)
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        # Update preference_to_chunks mapping (only for EPIC_inst)
+        if self.method == "EPIC_inst":
             for pref in preferences:
                 if pref not in self.preference_to_chunks:
                     self.preference_to_chunks[pref] = set()
@@ -1250,7 +1190,7 @@ class StreamSetup:
         self.stream_meta["total_chunks_indexed"] = len(self.chunk_metadata)
         
         # Update active chunks count
-        if self.method in ["EPIC_insight", "EPIC_inst"]:
+        if self.method == "EPIC_inst":
             self.stream_meta["active_chunks"] = sum(1 for m in self.chunk_metadata if m.get("active", True))
         else:
             # For standard and cosine: all chunks (no active concept)
@@ -1329,7 +1269,7 @@ class StreamSetup:
             "event_idx": event_idx,
             "total_docs_processed": self.stream_meta["total_docs_processed"],
             "total_chunks_indexed": len(self.chunk_metadata),
-            "active_chunks": sum(1 for m in self.chunk_metadata if m.get("active", True)) if self.method in ["EPIC_insight", "EPIC_inst"] else len(self.chunk_metadata),
+            "active_chunks": sum(1 for m in self.chunk_metadata if m.get("active", True)) if self.method == "EPIC_inst" else len(self.chunk_metadata),
             "timestamp": datetime.now().isoformat()
         }
         self.utils.save_json(progress_file, progress_info)
@@ -1373,7 +1313,6 @@ class StreamSetup:
                             metadata = {
                                 "id": chunk_id,
                                 "text": item["text"],
-                                "insight": item.get("insight"),
                                 "instruction": item.get("instruction"),
                                 "relevant_preferences": item.get("relevant_preferences", []),
                                 "active": True,
@@ -1394,11 +1333,61 @@ class StreamSetup:
                 self.next_chunk_id = max([m["id"] for m in self.chunk_metadata], default=0) + 1
                 print(f"✅ Restored {restored_chunks} chunks from checkpoint")
             
-            # Rebuild FAISS index from restored chunks (if needed for retrieval)
+            # Rebuild FAISS index from saved embeddings
             if self.chunk_metadata:
-                # FAISS will be rebuilt during processing, so we just initialize it
-                if self.faiss_index is None:
-                    self._init_faiss_index(self.embedding_dim)
+                # Try to load embeddings from indexing directory
+                root_dir = self.utils.root_dir
+                doc_mode_stream = f"{self.doc_mode}_stream"
+                
+                # Determine method suffix
+                if self.utils.llm_model_name == "openai/gpt-oss-20b":
+                    llm_suffix = "_oss"
+                elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+                    llm_suffix = "_qwen"
+                else:
+                    llm_suffix = ""
+                
+                # Build data_dir path for stream mode
+                if self.utils.dataset_name == "PrefWiki":
+                    method_name = f"{self.method}_prefwiki{llm_suffix}"
+                elif self.utils.dataset_name == "PrefELI5":
+                    method_name = f"{self.method}_prefeli5{llm_suffix}"
+                elif self.utils.dataset_name == "PrefRQ":
+                    method_name = f"{self.method}_rq{llm_suffix}"
+                elif self.utils.dataset_name == "PrefEval":
+                    method_name = f"{self.method}_prefeval{llm_suffix}"
+                else:
+                    method_name = f"{self.method}_prefwiki{llm_suffix}"
+                
+                data_dir = os.path.join(root_dir, "indexing", doc_mode_stream, method_name, str(self.persona_index))
+                model_name_clean = self.emb_model_name.replace('/', '_')
+                embeddings_file = os.path.join(data_dir, f"embeddings_{model_name_clean}.npy")
+                index_file = os.path.join(data_dir, f"index_{model_name_clean}.faiss")
+                
+                # Try to load FAISS index directly
+                if os.path.exists(index_file):
+                    try:
+                        self.faiss_index = faiss.read_index(index_file)
+                        print(f"✅ Restored FAISS index from {index_file} ({self.faiss_index.ntotal} vectors)")
+                        
+                        # Load embeddings and update metadata
+                        if os.path.exists(embeddings_file):
+                            embeddings_array = np.load(embeddings_file)
+                            # Match embeddings with metadata by chunk_id
+                            sorted_metadata = sorted(self.chunk_metadata, key=lambda x: x["id"])
+                            for i, meta in enumerate(sorted_metadata):
+                                if i < len(embeddings_array):
+                                    meta["embedding"] = embeddings_array[i]
+                    except Exception as e:
+                        print(f"⚠️ Failed to load FAISS index: {e}")
+                        # Fallback: initialize empty index
+                        if self.faiss_index is None:
+                            self._init_faiss_index(self.embedding_dim)
+                else:
+                    # No saved index, initialize empty
+                    if self.faiss_index is None:
+                        self._init_faiss_index(self.embedding_dim)
+                        print(f"⚠️ No saved FAISS index found, initialized empty index")
                 
         except Exception as e:
             print(f"⚠️ Failed to restore state: {e}")
@@ -1739,7 +1728,6 @@ class StreamSetup:
                         metadata = {
                             "id": chunk_id,
                             "text": item["text"],
-                            "insight": item.get("insight"),
                             "instruction": item.get("instruction"),
                             "relevant_preferences": item.get("relevant_preferences", []),
                             "active": True,
@@ -1758,9 +1746,59 @@ class StreamSetup:
             
             self.next_chunk_id = max([m["id"] for m in self.chunk_metadata], default=0) + 1
             
-            # Rebuild FAISS index (simplified - would need actual embeddings)
-            # For now, we'll need to reload from original data
-            print(f"⚠️ Note: FAISS index needs to be rebuilt from original data")
+            # Rebuild FAISS index from saved embeddings
+            root_dir = self.utils.root_dir
+            doc_mode_stream = f"{self.doc_mode}_stream"
+            
+            # Determine method suffix
+            if self.utils.llm_model_name == "openai/gpt-oss-20b":
+                llm_suffix = "_oss"
+            elif self.utils.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507":
+                llm_suffix = "_qwen"
+            else:
+                llm_suffix = ""
+            
+            # Build data_dir path for stream mode
+            if self.utils.dataset_name == "PrefWiki":
+                method_name = f"{self.method}_prefwiki{llm_suffix}"
+            elif self.utils.dataset_name == "PrefELI5":
+                method_name = f"{self.method}_prefeli5{llm_suffix}"
+            elif self.utils.dataset_name == "PrefRQ":
+                method_name = f"{self.method}_rq{llm_suffix}"
+            elif self.utils.dataset_name == "PrefEval":
+                method_name = f"{self.method}_prefeval{llm_suffix}"
+            else:
+                method_name = f"{self.method}_prefwiki{llm_suffix}"
+            
+            data_dir = os.path.join(root_dir, "indexing", doc_mode_stream, method_name, str(self.persona_index))
+            model_name_clean = self.emb_model_name.replace('/', '_')
+            embeddings_file = os.path.join(data_dir, f"embeddings_{model_name_clean}.npy")
+            index_file = os.path.join(data_dir, f"index_{model_name_clean}.faiss")
+            
+            # Try to load FAISS index directly
+            if os.path.exists(index_file):
+                try:
+                    self.faiss_index = faiss.read_index(index_file)
+                    print(f"✅ Restored FAISS index from {index_file} ({self.faiss_index.ntotal} vectors)")
+                    
+                    # Load embeddings and update metadata
+                    if os.path.exists(embeddings_file):
+                        embeddings_array = np.load(embeddings_file)
+                        # Match embeddings with metadata by chunk_id
+                        sorted_metadata = sorted(self.chunk_metadata, key=lambda x: x["id"])
+                        for i, meta in enumerate(sorted_metadata):
+                            if i < len(embeddings_array):
+                                meta["embedding"] = embeddings_array[i]
+                except Exception as e:
+                    print(f"⚠️ Failed to load FAISS index: {e}")
+                    # Fallback: initialize empty index
+                    if self.faiss_index is None:
+                        self._init_faiss_index(self.embedding_dim)
+            else:
+                # No saved index, initialize empty
+                if self.faiss_index is None:
+                    self._init_faiss_index(self.embedding_dim)
+                    print(f"⚠️ No saved FAISS index found, initialized empty index")
 
 
 class StreamManager:

@@ -167,8 +167,8 @@ class EPICUtils:
             self.chunk_file = os.path.join(self.root_dir_corpus, "final/sampled_eli5_chunk_2000.jsonl")
             self.embedding_file = os.path.join(self.root_dir_corpus, f"final/sampled_eli5_embedding_{model_name_clean}_2000.npy")
         elif doc_mode == "wiki_total":
-            self.chunk_file = os.path.join(self.root_dir_corpus, "full_chunks_with_doc_sw.jsonl")
-            self.embedding_file = os.path.join(self.root_dir_corpus, f"full_sw_embeddings_with_doc_{model_name_clean}.npy")
+            self.chunk_file = os.path.join(self.root_dir_corpus, "final/sampled_wiki_chunk.jsonl")
+            self.embedding_file = os.path.join(self.root_dir_corpus, f"final/sampled_wiki_embedding_{model_name_clean}.npy")
         elif doc_mode == "eli5_total":
             self.chunk_file = os.path.join(self.root_dir_corpus, "full_eli5_chunks_with_doc_sw.jsonl")
             self.embedding_file = os.path.join(self.root_dir_corpus, f"full_sw_eli5_embeddings_with_doc_{model_name_clean}.npy")
